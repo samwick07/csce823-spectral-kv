@@ -88,10 +88,22 @@ def compute_sliding_window_perplexity(
 
     seq_len = input_ids.shape[1]
 
+    # Import here to avoid circular import
+    try:
+        from ..spectral.attention import reset_all_caches
+        has_spectral = True
+    except ImportError:
+        has_spectral = False
+
     with torch.no_grad():
         for start in range(0, seq_len - window_size + 1, stride):
             end = start + window_size
             window = input_ids[:, start:end].to(device)
+
+            # Reset spectral caches between windows so each window
+            # is compressed independently (no cross-window cache leakage)
+            if has_spectral:
+                reset_all_caches(model)
 
             outputs = model(window)
             logits = outputs.logits

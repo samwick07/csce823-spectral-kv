@@ -1,200 +1,300 @@
-"""Compressed attention layer that applies spectral KV-cache compression.
+"""Spectral attention: LlamaAttention with KV-cache compression.
 
-This module patches Llama-3's attention mechanism to compress the KV cache
-in the spectral domain before performing attention computation.
+This module applies spectral KV-cache compression to Llama-3 attention layers
+by subclassing LlamaAttention and overriding the forward pass.
 
-The 2x2 factorial design is realized by combining:
-  - Transform: DCTTransform or FFTTransform
-  - Filter: FixedLowPassFilter or LearnableSpectralFilter
+The compression follows the FreqKV paradigm (arXiv:2505.00570, ICLR 2026):
+  1. Compute Q, K, V projections as normal.
+  2. Apply rotary position embeddings to Q, K.
+  3. [SPECTRAL] Transform K, V to spectral domain (DCT or FFT).
+  4. [SPECTRAL] Apply filter (fixed low-pass or learnable mask).
+  5. [SPECTRAL] Truncate to gamma fraction of coefficients.
+  6. [SPECTRAL] Reconstruct K, V from compressed spectral representation.
+  7. Repeat KV heads for GQA (8 KV heads -> 32 query heads).
+  8. Compute standard attention: softmax(Q @ K^T / sqrt(d)) @ V.
+  9. Output projection.
+
+The spectral-domain cache achieves O(gamma * N) storage instead of O(N).
+During training, the model learns to operate with the lossy reconstructed K/V.
+The learnable filter (if present) is updated via backpropagation.
+
+For GQA: Llama-3.1-8B uses 32 query heads and 8 KV heads. Compression is
+applied only to the 8 KV heads. Query heads are never compressed.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import Optional
+import math
+from typing import Optional, Tuple
 
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
+from torch import nn
 
+from .cache import CompressionConfig, SpectralKVCache
 from .transform import SpectralTransform, DCTTransform, FFTTransform
 from .filter import SpectralFilter, FixedLowPassFilter, LearnableSpectralFilter
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class CompressionConfig:
-    """Configuration for KV-cache spectral compression.
-
-    The transform_type and filter_type together define the ablation variant:
-      - DCT + Fixed     = FreqKV baseline
-      - DCT + Learnable = Isolates filter effect
-      - FFT + Fixed     = Isolates phase preservation effect
-      - FFT + Learnable = Full proposed method
-    """
-
-    transform_type: str = "dct"  # "dct" or "fft"
-    filter_type: str = "fixed"   # "fixed" or "learnable"
-    gamma: float = 0.22          # Fraction of spectral coefficients to retain
-    max_seq_len: int = 16384     # Max sequence length (for learnable filter init)
-    init_sharpness: float = 10.0 # Initial low-pass sharpness for learnable filter
-    init_offset: float = 0.0     # Initial cutoff offset for learnable filter
-
-    @property
-    def variant_name(self) -> str:
-        return f"{self.transform_type}_{self.filter_type}"
-
-    @property
-    def is_baseline(self) -> bool:
-        """True if this is the uncompressed baseline (gamma=1.0)."""
-        return self.gamma >= 1.0
-
-
-class CompressedAttention(nn.Module):
-    """Wrapper that applies spectral compression to KV cache during attention.
-
-    This is not a full attention implementation — it wraps the compression
-    logic that is applied to key/value tensors before the model's native
-    attention computation.
-
-    Usage:
-        compressor = CompressedAttention(config, num_heads=32, head_dim=128)
-        # During attention computation:
-        k_compressed, v_compressed = compressor.compress_kv(k, v)
-        # Then pass compressed K,V to the model's attention
-    """
-
-    def __init__(
-        self,
-        config: CompressionConfig,
-        num_heads: int,
-        head_dim: int,
-    ):
-        super().__init__()
-        self.config = config
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-
-        if config.is_baseline:
-            self.transform: Optional[SpectralTransform] = None
-            self.filter: Optional[SpectralFilter] = None
-            logger.info("Initialized baseline (no compression)")
-            return
-
-        # Select spectral transform
-        if config.transform_type == "dct":
-            self.transform = DCTTransform(dim=-2)
-        elif config.transform_type == "fft":
-            self.transform = FFTTransform(dim=-2)
-        else:
-            raise ValueError(f"Unknown transform_type: {config.transform_type}")
-
-        # Select spectral filter
-        if config.filter_type == "fixed":
-            self.filter = FixedLowPassFilter()
-        elif config.filter_type == "learnable":
-            self.filter = LearnableSpectralFilter(
-                num_heads=num_heads,
-                max_seq_len=config.max_seq_len,
-                head_dim=head_dim,
-                init_sharpness=config.init_sharpness,
-                init_offset=config.init_offset,
-            )
-        else:
-            raise ValueError(f"Unknown filter_type: {config.filter_type}")
-
-        logger.info(
-            f"Initialized compression: {config.variant_name}, gamma={config.gamma}"
-        )
-
-    def compress_kv(
-        self,
-        keys: torch.Tensor,
-        values: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compress key and value tensors in the spectral domain.
-
-        Args:
-            keys: Key tensor [batch, num_heads, seq_len, head_dim]
-            values: Value tensor [batch, num_heads, seq_len, head_dim]
-
-        Returns:
-            Tuple of (compressed_keys, compressed_values) — reconstructed to
-            the original spatial domain but with high-frequency components removed.
-        """
-        if self.config.is_baseline:
-            return keys, values
-
-        seq_len = keys.shape[-2]
-        gamma = self.config.gamma
-
-        # Transform to spectral domain
-        k_spectral = self.transform.forward(keys)
-        v_spectral = self.transform.forward(values)
-
-        # Apply learnable filter (if using learnable; fixed is a no-op)
-        k_spectral = self.filter.forward(k_spectral, gamma)
-        v_spectral = self.filter.forward(v_spectral, gamma)
-
-        # Truncate to retain gamma fraction of coefficients
-        k_spectral = self.transform.truncate(k_spectral, gamma)
-        v_spectral = self.transform.truncate(v_spectral, gamma)
-
-        # Reconstruct to spatial domain
-        # The reconstructed tensors have length = gamma * original_seq_len
-        # The attention mechanism will operate on this compressed representation
-        k_compressed = self.transform.inverse(k_spectral, target_len=seq_len)
-        v_compressed = self.transform.inverse(v_spectral, target_len=seq_len)
-
-        return k_compressed, v_compressed
-
-    def get_compressed_cache_size(self, seq_len: int) -> int:
-        """Return the number of spectral coefficients retained for a given seq_len.
-
-        This is the effective cache size after compression.
-        """
-        if self.config.is_baseline:
-            return seq_len
-        return max(1, int(seq_len * self.config.gamma))
-
-    def get_filter_mask(self) -> Optional[torch.Tensor]:
-        """Return the current filter mask (for learnable filters only)."""
-        if isinstance(self.filter, LearnableSpectralFilter):
-            return self.filter.get_mask()
-        return None
-
-
-def apply_compression_to_model(
+def apply_spectral_compression(
     model: nn.Module,
     config: CompressionConfig,
-    num_heads: int,
-    head_dim: int,
 ) -> nn.Module:
-    """Apply spectral KV-cache compression to a transformer model.
+    """Apply spectral KV-cache compression to a Llama model.
 
-    This function creates a CompressedAttention wrapper and registers it
-    as a module attribute on the model. The actual patching of attention
-    layers requires model-specific hooks — see the training pipeline for
-    integration with HuggingFace's LlamaModel.
+    Wraps each attention layer's forward method to insert spectral compression
+    between K/V projection and attention computation. The spectral caches
+    (containing learnable filter parameters) are registered as submodules so
+    their parameters are included in the model's parameter list for training.
 
     Args:
-        model: The transformer model (e.g., LlamaForCausalLM).
-        config: Compression configuration.
-        num_heads: Number of attention heads.
-        head_dim: Dimension per attention head.
+        model: A LlamaForCausalLM model.
+        config: Compression configuration (transform type, filter type, gamma).
 
     Returns:
-        The model with compression wrapper attached.
+        The model (modified in-place) with spectral compression applied.
     """
-    compressor = CompressedAttention(config, num_heads, head_dim)
-    model.spectral_compressor = compressor
+    if config.is_baseline:
+        logger.info("Baseline config: no spectral compression applied")
+        return model
 
-    if not config.is_baseline and config.filter_type == "learnable":
-        # Register learnable filter parameters with the model so they're
-        # included in the optimizer and checkpointed
-        for name, param in compressor.filter.named_parameters():
-            model.register_parameter(f"spectral_filter_{name}", param)
-            logger.info(f"Registered learnable spectral parameter: spectral_filter_{name}")
+    logger.info(
+        f"Applying spectral compression: transform={config.transform_type}, "
+        f"filter={config.filter_type}, gamma={config.gamma}"
+    )
 
+    # Find all attention layers: LlamaForCausalLM -> model.model.layers[i].self_attn
+    layers = model.model.layers
+    num_layers = len(layers)
+    logger.info(f"Found {num_layers} transformer layers")
+
+    for i, layer in enumerate(layers):
+        attn = layer.self_attn
+
+        # Read architecture constants from the attention module
+        num_kv_heads = attn.num_key_value_heads
+        head_dim = attn.head_dim
+
+        # Create spectral cache for this layer
+        spectral_cache = SpectralKVCache(config, num_kv_heads, head_dim)
+
+        # Register the cache as a submodule so its parameters are tracked
+        attn.add_module("spectral_cache", spectral_cache)
+
+        # Store original forward and wrap it
+        original_forward = attn.forward
+
+        def make_wrapped_forward(
+            attn_module: nn.Module,
+            cache: SpectralKVCache,
+            orig_fwd,
+            layer_idx: int,
+        ):
+            """Create a closure that has direct access to the attn module."""
+
+            def wrapped_forward(
+                hidden_states: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.Tensor] = None,
+                past_key_value=None,
+                output_attentions: bool = False,
+                use_cache: bool = False,
+                **kwargs,
+            ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple]]:
+                return _spectral_forward(
+                    attn_module=attn_module,
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    spectral_cache=cache,
+                    layer_idx=layer_idx,
+                    **kwargs,
+                )
+
+            return wrapped_forward
+
+        attn.forward = make_wrapped_forward(attn, spectral_cache, original_forward, i)
+
+    logger.info(f"Spectral compression applied to {num_layers} layers")
     return model
+
+
+def _spectral_forward(
+    attn_module: nn.Module,
+    hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.Tensor] = None,
+    past_key_value=None,
+    output_attentions: bool = False,
+    use_cache: bool = False,
+    spectral_cache: SpectralKVCache = None,
+    layer_idx: int = 0,
+    **kwargs,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple]]:
+    """Reimplemented LlamaAttention.forward with spectral KV compression.
+
+    This follows the standard Llama attention computation, inserting spectral
+    compression after K/V projections and rotary embeddings.
+
+    Handles both older transformers (rotary_emb on the attention module) and
+    newer versions (position_embeddings passed as kwargs).
+    """
+    from transformers.models.llama.modeling_llama import (
+        apply_rotary_pos_emb,
+        repeat_kv,
+    )
+
+    bsz, q_len, _ = hidden_states.shape
+
+    # 1. Project hidden_states to Q, K, V
+    query_states = attn_module.q_proj(hidden_states)
+    key_states = attn_module.k_proj(hidden_states)
+    value_states = attn_module.v_proj(hidden_states)
+
+    num_q_heads = attn_module.num_heads
+    num_kv_heads = attn_module.num_key_value_heads
+    head_dim = attn_module.head_dim
+
+    # Reshape to [B, num_heads, S, head_dim]
+    query_states = query_states.view(bsz, q_len, num_q_heads, head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+
+    # 2. Apply rotary position embeddings
+    # Handle different transformers versions:
+    #   - Newer (>=4.46): position_embeddings=(cos, sin) passed as kwarg
+    #   - Older (<4.46): rotary_emb module on the attention layer
+    position_embeddings = kwargs.get("position_embeddings", None)
+    if position_embeddings is not None:
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    elif hasattr(attn_module, "rotary_emb") and attn_module.rotary_emb is not None:
+        cos, sin = attn_module.rotary_emb(value_states, position_ids)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+    else:
+        logger.warning_once(
+            f"Layer {layer_idx}: No rotary embeddings found. "
+            f"Pass position_embeddings=(cos, sin) or ensure rotary_emb is set."
+        )
+
+    # 3. [SPECTRAL] Compress K, V into spectral domain
+    #    Transform -> Filter -> Truncate -> Store compressed coefficients
+    spectral_cache.compress(key_states, value_states)
+
+    # 4. [SPECTRAL] Reconstruct K, V from compressed spectral representation
+    #    This is the lossy reconstruction that the model learns to work with
+    key_states, value_states = spectral_cache.reconstruct(target_seq_len=q_len)
+
+    # 5. Repeat KV heads for GQA (8 KV heads -> 32 query heads)
+    key_states = repeat_kv(key_states, num_q_heads // num_kv_heads)
+    value_states = repeat_kv(value_states, num_q_heads // num_kv_heads)
+
+    # 6. Compute attention: Q @ K^T / sqrt(d)
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
+
+    # Apply attention mask (causal mask from HF is [B, 1, 1, S])
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    # Softmax in float32 for numerical stability
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+    # Apply attention to values
+    attn_output = torch.matmul(attn_weights, value_states)
+
+    # 7. Reshape and output projection
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, num_q_heads * head_dim)
+    attn_output = attn_module.o_proj(attn_output)
+
+    # Return in HF's expected format: (output, attn_weights, past_key_value)
+    if output_attentions:
+        return attn_output, attn_weights, past_key_value
+    return attn_output, None, past_key_value
+
+
+def get_spectral_caches(model: nn.Module) -> list[SpectralKVCache]:
+    """Extract all spectral caches from a model (for inspection or logging).
+
+    Args:
+        model: A LlamaForCausalLM with spectral compression applied.
+
+    Returns:
+        List of SpectralKVCache objects, one per layer.
+    """
+    caches = []
+    for layer in model.model.layers:
+        attn = layer.self_attn
+        if hasattr(attn, "spectral_cache"):
+            caches.append(attn.spectral_cache)
+    return caches
+
+
+def get_compression_stats(model: nn.Module) -> list[dict]:
+    """Get compression statistics from all layers.
+
+    Args:
+        model: A LlamaForCausalLM with spectral compression applied.
+
+    Returns:
+        List of dicts with per-layer compression stats.
+    """
+    stats = []
+    for i, cache in enumerate(get_spectral_caches(model)):
+        stats.append({
+            "layer": i,
+            "compression_ratio": cache.get_compression_ratio(),
+            "cache_size_bytes": cache.get_cache_size_bytes(),
+            "is_spectral": cache._is_spectral,
+            **cache.compression_stats,
+        })
+    return stats
+
+
+def get_learnable_filter_params(model: nn.Module) -> list[nn.Parameter]:
+    """Get all learnable filter parameters from the model.
+
+    Used for LoRA modules_to_save configuration and for inspecting
+    the learned frequency masks.
+
+    Args:
+        model: A LlamaForCausalLM with spectral compression applied.
+
+    Returns:
+        List of learnable filter parameter tensors.
+    """
+    params = []
+    for cache in get_spectral_caches(model):
+        params.extend(cache.get_learnable_parameters())
+    return params
+
+
+def reset_all_caches(model: nn.Module) -> None:
+    """Reset all spectral KV caches in the model.
+
+    Call between sequences during evaluation to clear cached states.
+    """
+    for cache in get_spectral_caches(model):
+        cache.reset()
+
+
+# Backward compatibility with the old API
+class CompressedAttention:
+    """Deprecated: use apply_spectral_compression() instead.
+
+    Kept for backward compatibility with older code that references
+    CompressedAttention. This class is a no-op wrapper.
+    """
+
+    def __init__(self, config: CompressionConfig, num_kv_heads: int = 8, head_dim: int = 128):
+        self.config = config
+        self.spectral_cache = SpectralKVCache(config, num_kv_heads, head_dim)
+
+    def apply_to_model(self, model: nn.Module) -> nn.Module:
+        return apply_spectral_compression(model, self.config)

@@ -6,6 +6,15 @@ Two transforms are provided:
   - FFTTransform: Complex-valued Fast Fourier Transform. Preserves phase.
 
 Both operate along the sequence dimension of key/value tensors.
+
+The FreqKV approach (arXiv:2505.00570, ICLR 2026):
+  1. Transform the KV cache into the spectral domain.
+  2. Truncate to retain only the lowest-frequency gamma fraction.
+  3. Store the compressed spectral representation as the cache.
+  4. Reconstruct to the spatial domain only when attention needs to
+     compute Q @ K^T.
+
+This gives a true O(gamma * N) cache size instead of O(N).
 """
 
 from __future__ import annotations
@@ -65,6 +74,16 @@ class SpectralTransform(ABC, nn.Module):
         """
         ...
 
+    @abstractmethod
+    def spectral_len(self, seq_len: int) -> int:
+        """Return the length of the spectral representation for a given seq_len."""
+        ...
+
+    @abstractmethod
+    def pad_to_len(self, x_spectral: torch.Tensor, target_spectral_len: int) -> torch.Tensor:
+        """Zero-pad spectral coefficients to a target length (for batch operations)."""
+        ...
+
 
 class DCTTransform(SpectralTransform):
     """Discrete Cosine Transform (DCT-II) for KV-cache compression.
@@ -72,13 +91,17 @@ class DCTTransform(SpectralTransform):
     This is the FreqKV baseline transform. The DCT is real-valued and
     discards phase information. Implemented via torch.fft for efficiency
     using the FFT-based DCT algorithm.
+
+    The DCT produces N real coefficients for a length-N input. After
+    truncation to gamma*N coefficients, the inverse DCT must zero-pad
+    back to N coefficients before reconstructing.
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply DCT-II along the sequence dimension.
 
         Uses the standard FFT-based DCT algorithm:
-        DCT(x) = Re(FFT(x_reordered)) * scale_factors
+        DCT(x) = Re(FFT(x_reordered)) * phase_factors
         """
         N = x.shape[self.dim]
 
@@ -103,8 +126,28 @@ class DCTTransform(SpectralTransform):
         return dct
 
     def inverse(self, x_spectral: torch.Tensor, target_len: int) -> torch.Tensor:
-        """Apply inverse DCT (DCT-III) to reconstruct the spatial tensor."""
-        N = x_spectral.shape[self.dim]
+        """Apply inverse DCT (DCT-III) to reconstruct the spatial tensor.
+
+        If x_spectral has been truncated to fewer coefficients than target_len,
+        we zero-pad back to target_len before applying the inverse DCT.
+
+        Args:
+            x_spectral: Spectral representation (possibly truncated).
+            target_len: Original sequence length for reconstruction.
+        """
+        current_len = x_spectral.shape[self.dim]
+
+        # Zero-pad spectral coefficients back to target_len if truncated
+        if current_len < target_len:
+            pad_shape = list(x_spectral.shape)
+            pad_shape[self.dim] = target_len - current_len
+            padding = torch.zeros(pad_shape, device=x_spectral.device, dtype=x_spectral.dtype)
+            x_spectral = torch.cat([x_spectral, padding], dim=self.dim)
+        elif current_len > target_len:
+            # Truncate to target_len (shouldn't happen, but be safe)
+            x_spectral = x_spectral.narrow(self.dim, 0, target_len)
+
+        N = target_len
 
         # DCT-III via FFT
         k = torch.arange(N, device=x_spectral.device, dtype=x_spectral.dtype)
@@ -118,17 +161,38 @@ class DCTTransform(SpectralTransform):
 
         # Undo the interleaving
         half = (target_len + 1) // 2
-        x = torch.empty_like(x_spectral)
+        x = torch.empty(
+            *x_spectral.shape[:-1], target_len,
+            device=x_spectral.device, dtype=V.real.dtype,
+        )
         x[..., 0::2] = V[..., :half].real
         x[..., 1::2] = V[..., half:].real.flip(self.dim)
 
         return x
 
     def truncate(self, x_spectral: torch.Tensor, gamma: float) -> torch.Tensor:
-        """Retain the lowest-frequency gamma fraction of DCT coefficients."""
+        """Retain the lowest-frequency gamma fraction of DCT coefficients.
+
+        The DCT produces N coefficients for a length-N input. We keep the
+        first gamma*N coefficients (lowest frequencies).
+        """
         N = x_spectral.shape[self.dim]
         keep = max(1, int(N * gamma))
         return x_spectral.narrow(self.dim, 0, keep)
+
+    def spectral_len(self, seq_len: int) -> int:
+        """DCT produces N real coefficients for a length-N input."""
+        return seq_len
+
+    def pad_to_len(self, x_spectral: torch.Tensor, target_spectral_len: int) -> torch.Tensor:
+        """Zero-pad DCT coefficients to a target length."""
+        current = x_spectral.shape[self.dim]
+        if current >= target_spectral_len:
+            return x_spectral.narrow(self.dim, 0, target_spectral_len)
+        pad_shape = list(x_spectral.shape)
+        pad_shape[self.dim] = target_spectral_len - current
+        padding = torch.zeros(pad_shape, device=x_spectral.device, dtype=x_spectral.dtype)
+        return torch.cat([x_spectral, padding], dim=self.dim)
 
 
 class FFTTransform(SpectralTransform):
@@ -136,6 +200,9 @@ class FFTTransform(SpectralTransform):
 
     Unlike the DCT, the complex FFT preserves phase information.
     The full proposed method uses this transform.
+
+    Uses rfft/irfft for real-valued input, which returns N//2+1 complex
+    coefficients for a length-N input.
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -163,3 +230,17 @@ class FFTTransform(SpectralTransform):
         N = x_spectral.shape[self.dim]
         keep = max(1, int(N * gamma))
         return x_spectral.narrow(self.dim, 0, keep)
+
+    def spectral_len(self, seq_len: int) -> int:
+        """rfft returns N//2+1 complex coefficients for a length-N input."""
+        return seq_len // 2 + 1
+
+    def pad_to_len(self, x_spectral: torch.Tensor, target_spectral_len: int) -> torch.Tensor:
+        """Zero-pad FFT coefficients to a target length."""
+        current = x_spectral.shape[self.dim]
+        if current >= target_spectral_len:
+            return x_spectral.narrow(self.dim, 0, target_spectral_len)
+        pad_shape = list(x_spectral.shape)
+        pad_shape[self.dim] = target_spectral_len - current
+        padding = torch.zeros(pad_shape, device=x_spectral.device, dtype=x_spectral.dtype)
+        return torch.cat([x_spectral, padding], dim=self.dim)

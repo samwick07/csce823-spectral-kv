@@ -24,7 +24,7 @@ class ExperimentConfig:
     init_offset: float = 0.0
 
     # Model settings
-    model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct"
+    model_name: str = "meta-llama/Llama-3.1-8B-Instruct"
     lora_rank: int = 8
     lora_alpha: int = 16
     lora_dropout: float = 0.05

@@ -16,13 +16,14 @@ from .metrics import compute_sliding_window_perplexity
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
+DEFAULT_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 WINDOW_SIZE = 256
 
 
 def evaluate_proof_pile(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer | None = None,
+    model_name: str = DEFAULT_MODEL_NAME,
     num_samples: int = 100,
     window_size: int = WINDOW_SIZE,
     device: str = "cuda",
@@ -32,8 +33,9 @@ def evaluate_proof_pile(
     """Evaluate model on Proof-pile benchmark.
 
     Args:
-        model: The language model.
+        model: The language model (possibly with spectral compression).
         tokenizer: Tokenizer (loaded if None).
+        model_name: Model name for loading tokenizer if not provided.
         num_samples: Number of documents to evaluate.
         window_size: Sliding window size (default 256 per protocol).
         device: Device to run on.
@@ -44,7 +46,7 @@ def evaluate_proof_pile(
         Dict with perplexity statistics.
     """
     if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=hf_token)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
 
     logger.info(f"Evaluating Proof-pile: {num_samples} docs, window={window_size}")
 

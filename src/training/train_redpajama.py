@@ -1,6 +1,14 @@
-"""Fine-tuning on RedPajama: 1,000 steps, batch 64, 8K context.
+"""Phase 1: Continued pre-training on RedPajama with spectral KV compression.
 
-Following FreqKV's training protocol for direct comparability.
+Trains the model with spectral KV-cache compression active during the forward
+pass. This teaches the model to operate with the lossy reconstructed K/V
+states and (for learnable filters) trains the frequency selection mask.
+
+Following FreqKV protocol:
+  - 1000 steps of continued pre-training on RedPajama
+  - LoRA rank 8 on attention projections
+  - DeepSpeed ZeRO-2 for 8x H200
+  - Spectral compression applied per-forward-pass
 """
 
 from __future__ import annotations
@@ -10,168 +18,145 @@ from pathlib import Path
 
 import torch
 from datasets import load_dataset
+from peft import get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     Trainer,
     TrainingArguments,
+    DataCollatorForLanguageModeling,
 )
-from peft import get_peft_model
 
-from ..spectral.attention import CompressionConfig, apply_compression_to_model
+from ..spectral import CompressionConfig, apply_spectral_compression
+from ..spectral.attention import reset_all_caches
 from .lora_config import create_lora_config
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
-DATASET_NAME = "togethercomputer/RedPajama-Data-1T-Sample"
-CONTEXT_LENGTH = 8192
-BATCH_SIZE = 64
-NUM_STEPS = 1000
 
-
-def load_redpajama_dataset(
-    context_length: int = CONTEXT_LENGTH,
-    num_samples: int | None = None,
-) -> "datasets.Dataset":
-    """Load and tokenize RedPajama dataset.
-
-    Args:
-        context_length: Sequence length for tokenization.
-        num_samples: Optional limit on number of samples.
-
-    Returns:
-        Tokenized dataset.
-    """
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    dataset = load_dataset(DATASET_NAME, split="train")
-
-    if num_samples:
-        dataset = dataset.select(range(min(num_samples, len(dataset))))
-
-    def tokenize_fn(examples):
-        texts = examples.get("text", [])
-        tokenized = tokenizer(
-            texts,
-            truncation=True,
-            max_length=context_length,
-            padding="max_length",
-            return_tensors="pt",
-        )
-        tokenized["labels"] = tokenized["input_ids"].clone()
-        return tokenized
-
-    dataset = dataset.map(
-        tokenize_fn,
-        batched=True,
-        batch_size=100,
-        remove_columns=dataset.column_names,
-        num_proc=4,
-    )
-
-    logger.info(f"Loaded RedPajama: {len(dataset)} samples, context={context_length}")
-    return dataset
-
-
-def train_on_redpajama(
-    compression_config: CompressionConfig,
-    output_dir: str | Path = "results/checkpoints/redpajama",
-    num_gpus: int = 8,
-    batch_size_per_gpu: int = 8,
-    num_steps: int = NUM_STEPS,
-    context_length: int = CONTEXT_LENGTH,
-    learning_rate: float = 1e-5,
-    warmup_steps: int = 100,
-    deepspeed_config: str | None = None,
+def train_redpajama(
+    config,
     hf_token: str | None = None,
+    output_dir: str = "checkpoints",
 ) -> str:
-    """Fine-tune Llama-3-8B-Instruct on RedPajama with spectral compression.
+    """Phase 1: Continued pre-training on RedPajama with spectral compression.
 
     Args:
-        compression_config: KV-cache compression configuration.
+        config: ExperimentConfig with model_name, compression settings, etc.
+        hf_token: HuggingFace token for gated models.
         output_dir: Directory to save checkpoints.
-        num_gpus: Number of GPUs.
-        batch_size_per_gpu: Micro-batch size per GPU.
-        num_steps: Number of training steps (default 1000 per FreqKV protocol).
-        context_length: Context window size (default 8192).
-        learning_rate: Peak learning rate.
-        warmup_steps: Linear warmup steps.
-        deepspeed_config: Path to DeepSpeed config JSON.
-        hf_token: HuggingFace token for gated model access.
 
     Returns:
         Path to the saved checkpoint directory.
     """
-    output_dir = Path(output_dir) / compression_config.variant_name
-    output_dir.mkdir(parents=True, exist_ok=True)
+    model_name = config.model_name
+    logger.info(f"Phase 1: RedPajama CPT on {model_name}")
+    logger.info(
+        f"Compression: {config.transform_type}/{config.filter_type}, "
+        f"gamma={config.gamma}"
+    )
 
-    logger.info(f"Training {compression_config.variant_name} on RedPajama")
-    logger.info(f"  gamma={compression_config.gamma}, steps={num_steps}")
-
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=hf_token)
+    # 1. Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Load model
+    # 2. Load model with FlashAttention-2
     model = AutoModelForCausalLM.from_pretrained(
-        MODEL_NAME,
-        torch_dtype=torch.bfloat16,
+        model_name,
         token=hf_token,
+        torch_dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+        device_map="auto",
     )
 
-    # Get model config for compression setup
-    num_heads = model.config.num_attention_heads
-    head_dim = model.config.hidden_size // num_heads
+    # 3. Apply spectral compression BEFORE LoRA
+    #    This inserts the spectral cache into each attention layer
+    comp_config = CompressionConfig(
+        transform_type=config.transform_type,
+        filter_type=config.filter_type,
+        gamma=config.gamma,
+        max_seq_len=config.max_seq_len,
+        init_sharpness=config.init_sharpness,
+        init_offset=config.init_offset,
+    )
+    model = apply_spectral_compression(model, comp_config)
 
-    # Apply spectral compression
-    model = apply_compression_to_model(model, compression_config, num_heads, head_dim)
-
-    # Apply LoRA
-    lora_config = create_lora_config(rank=8)
+    # 4. Apply LoRA (spectral_cache modules saved via modules_to_save)
+    lora_config = create_lora_config(
+        rank=config.lora_rank,
+        alpha=config.lora_alpha,
+        dropout=config.lora_dropout,
+    )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # Load dataset
-    dataset = load_redpajama_dataset(context_length=context_length)
-
-    # Training arguments
-    training_args = TrainingArguments(
-        output_dir=str(output_dir),
-        num_train_epochs=1,  # Controlled by max_steps instead
-        max_steps=num_steps,
-        per_device_train_batch_size=batch_size_per_gpu,
-        gradient_accumulation_steps=BATCH_SIZE // (batch_size_per_gpu * num_gpus),
-        learning_rate=learning_rate,
-        warmup_steps=warmup_steps,
-        lr_scheduler_type="linear",
-        logging_steps=10,
-        save_steps=num_steps // 4,
-        save_total_limit=2,
-        bf16=True,
-        gradient_checkpointing=True,
-        deepspeed=deepspeed_config,
-        report_to="wandb" if torch.distributed.is_available() else "none",
-        run_name=f"redpajama_{compression_config.variant_name}_gamma{compression_config.gamma}",
+    # 5. Load and tokenize RedPajama
+    logger.info("Loading RedPajama dataset")
+    dataset = load_dataset(
+        "togethercomputer/RedPajama-Data-1T-Sample",
+        split="train",
     )
 
-    # Trainer
+    def tokenize_fn(examples):
+        # RedPajama sample has 'text' field
+        return tokenizer(
+            examples["text"],
+            truncation=True,
+            max_length=config.max_seq_len,
+            padding=False,
+        )
+
+    tokenized = dataset.map(
+        tokenize_fn,
+        batched=True,
+        remove_columns=dataset.column_names,
+        num_proc=8,
+    )
+
+    # Data collator for causal LM (handles padding)
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,
+    )
+
+    # 6. Training arguments
+    training_args = TrainingArguments(
+        output_dir=f"{output_dir}/{config.config_id}/phase1_redpajama",
+        num_train_epochs=1,
+        max_steps=config.redpajama_steps,
+        per_device_train_batch_size=config.batch_size_per_gpu,
+        gradient_accumulation_steps=1,
+        learning_rate=config.learning_rate,
+        warmup_steps=config.warmup_steps,
+        weight_decay=config.weight_decay,
+        bf16=True,
+        logging_steps=10,
+        save_strategy="steps",
+        save_steps=500,
+        save_total_limit=2,
+        deepspeed=config.deepspeed_config,
+        report_to="wandb",
+        run_name=f"{config.config_id}_phase1_redpajama",
+        gradient_checkpointing=True,
+        remove_unused_columns=False,
+    )
+
+    # 7. Train
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=dataset,
-        tokenizer=tokenizer,
+        train_dataset=tokenized,
+        data_collator=data_collator,
     )
 
-    # Train
+    logger.info("Starting Phase 1 training")
     trainer.train()
 
-    # Save
-    trainer.save_model(str(output_dir / "final"))
-    tokenizer.save_pretrained(str(output_dir / "final"))
+    # 8. Save checkpoint
+    ckpt_dir = Path(output_dir) / config.config_id / "phase1_redpajama" / "final"
+    trainer.save_model(str(ckpt_dir))
+    tokenizer.save_pretrained(str(ckpt_dir))
+    logger.info(f"Phase 1 checkpoint saved to {ckpt_dir}")
 
-    logger.info(f"Training complete. Checkpoint saved to {output_dir / 'final'}")
-    return str(output_dir / "final")
+    return str(ckpt_dir)

@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
+DEFAULT_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 
 # LongBench task definitions
 LONGBENCH_TASKS = {
@@ -46,6 +46,7 @@ LONGBENCH_TASKS = {
 def evaluate_longbench(
     model: torch.nn.Module,
     tokenizer: AutoTokenizer | None = None,
+    model_name: str = DEFAULT_MODEL_NAME,
     tasks: list[str] | None = None,
     max_new_tokens: int = 256,
     temperature: float = 0.7,
@@ -58,8 +59,9 @@ def evaluate_longbench(
     """Evaluate model on LongBench V1 benchmark.
 
     Args:
-        model: The language model.
+        model: The language model (possibly with spectral compression).
         tokenizer: Tokenizer (loaded if None).
+        model_name: Model name for loading tokenizer if not provided.
         tasks: List of task names to evaluate. None = all 14 tasks.
         max_new_tokens: Maximum generation length.
         temperature: Sampling temperature (0.7 per protocol).
@@ -73,7 +75,7 @@ def evaluate_longbench(
         Dict with per-task accuracy scores.
     """
     if tokenizer is None:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=hf_token)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
 
     if tasks is None:
         tasks = list(LONGBENCH_TASKS.keys())
