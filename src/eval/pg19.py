@@ -12,10 +12,10 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from .metrics import compute_sliding_window_perplexity
+from ..utils.constants import DEFAULT_MODEL_NAME
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 WINDOW_SIZE = 256
 
 

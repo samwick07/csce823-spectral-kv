@@ -15,9 +15,9 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
-logger = logging.getLogger(__name__)
+from ..utils.constants import DEFAULT_MODEL_NAME
 
-DEFAULT_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+logger = logging.getLogger(__name__)
 
 # LongBench task definitions
 LONGBENCH_TASKS = {
@@ -55,6 +55,7 @@ def evaluate_longbench(
     seed: int = 0,
     hf_token: str | None = None,
     longbench_dir: str | None = None,
+    num_samples: int | None = None,
 ) -> dict:
     """Evaluate model on LongBench V1 benchmark.
 
@@ -70,6 +71,8 @@ def evaluate_longbench(
         seed: Random seed for generation.
         hf_token: HuggingFace token.
         longbench_dir: Path to LongBench evaluation code (for metrics).
+        num_samples: If set, evaluate only the first N samples per task
+                     (useful for smoke tests). None = full dataset.
 
     Returns:
         Dict with per-task accuracy scores.
@@ -101,11 +104,17 @@ def evaluate_longbench(
             # Load task data from HuggingFace
             from datasets import load_dataset
 
-            dataset = load_dataset("THUDM/LongBench", task_name, split="test")
+            dataset = load_dataset(
+                "THUDM/LongBench", task_name, split="test",
+                trust_remote_code=True,
+            )
 
             task_scores = []
 
-            for sample in dataset:
+            for sample_idx, sample in enumerate(dataset):
+                if num_samples is not None and sample_idx >= num_samples:
+                    break
+
                 context = sample.get("context", "")
                 input_text = sample.get("input", "")
                 answers = sample.get("answers", [])

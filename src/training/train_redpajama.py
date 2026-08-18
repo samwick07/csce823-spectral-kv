@@ -61,12 +61,16 @@ def train_redpajama(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. Load model with FlashAttention-2
+    # 2. Load model with eager attention.
+    #    We override LlamaAttention.forward entirely with the spectral
+    #    compression path (manual Q@K^T + softmax), so FlashAttention-2
+    #    is never used for the compressed attention computation. Using
+    #    "eager" avoids version-specific SDPA flag confusion.
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         token=hf_token,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="eager",
         device_map="auto",
     )
 

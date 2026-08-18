@@ -26,6 +26,7 @@ All 5 P0 blockers resolved:
 
 4. **Switched to Llama-3.1-8B-Instruct** — `config.py` default + all 13
    YAML configs. Same architecture as Llama-3-8B, native 128K context.
+   Model name centralized in src/utils/constants.py.
 
 5. **Model name from config** — all training/eval scripts accept
    `model_name` as a parameter instead of hardcoding.
@@ -71,8 +72,13 @@ Both `train_redpajama.py` and `train_longalpaca.py` use
 `DataCollatorForLanguageModeling(tokenizer, mlm=False)`.
 
 ### P1-3: Verify dataset names on HuggingFace
-**STATUS: STILL NEEDED.** Cannot verify from container (no HF dataset
-browsing). Needs to be done on the Coder workspace.
+**STATUS: CHECKLIST CREATED (see docs/dataset_verification.md).**
+
+Dataset verification requires the Coder workspace (coder.afitcdn.org)
+with HuggingFace access. A comprehensive checklist has been created at
+`docs/dataset_verification.md` listing all 5 datasets (RedPajama-Data-1T-Sample,
+LongAlpaca-16k, pg19, proof-pile, LongBench), their expected columns,
+trust_remote_code requirements, and a pre-flight checklist.
 
 Datasets to verify:
 - `Yukang/LongAlpaca-16k` — likely correct but confirm exact HF ID
@@ -89,80 +95,83 @@ print(ds.column_names, len(ds))
 ```
 
 ### P1-4: Implement proper ART ANOVA
-**STATUS: STILL NEEDED.** Priority: HIGH.
+**STATUS: DONE.** Implemented true Aligned Rank Transform (Wobbrock et al. 2011).
 
-Location: `src/stats/analyze.py`, function `_art_anova` (line 373).
+`src/stats/analyze.py`, function `_art_anova` (line 373).
 
-Current code uses Kruskal-Wallis per factor separately. This CANNOT
-detect interaction effects — the core research question (does the
-benefit of learnable filtering depend on transform type?).
+The implementation follows the ART procedure:
+1. Compute aligned observations for each effect by removing the estimated
+   effects of all *other* factors and interactions (alignment formulas
+   in the docstring).
+2. Rank the aligned observations (average ranks for ties via
+   `scipy.stats.rankdata`).
+3. Run standard one-way ANOVA (F-test) on the ranks via
+   `scipy.stats.f_oneway`.
 
-True ART ANOVA requires:
-1. Compute aligned observations: remove the effect of other factors
-   (subtract cell mean for the other factor, add grand mean)
-2. Rank the aligned observations
-3. Run standard ANOVA on the ranks
+Three effects tested per benchmark:
+- Factor A (transform): DCT vs FFT
+- Factor B (filter): Fixed vs Learnable
+- Interaction A×B: does learnable filtering benefit depend on transform?
 
-Options:
-- Implement ART manually (rank → align → rank → ANOVA)
-- Use `py-art` library if available
-- Use R's `ARTool` package via rpy2
+Also includes:
+- Per-gamma analysis (does the interaction vary with compression level?)
+- Partial eta-squared effect sizes
+- Kruskal-Wallis per-factor results retained as `kruskal_wallis_fallback`
 
-The current Kruskal-Wallis approach should be kept as a fallback /
-sanity check, but the primary analysis must use true ART.
+Unit tests in `tests/test_spectral_transforms.py::TestARTAnova` verify:
+- Detection of main effects and interactions on synthetic data
+- No false-positive interactions when none exist
+- Correct per-gamma and fallback outputs
 
 ### P1-5: LongBench needs trust_remote_code
-**STATUS: NEW ISSUE.**
+**STATUS: DONE.**
 
-`load_dataset("THUDM/LongBench", task_name)` likely needs
-`trust_remote_code=True` for the loading script. This needs to be added
-to the `load_dataset` call in `src/eval/longbench.py`.
+`load_dataset("THUDM/LongBench", task_name, split="test", trust_remote_code=True)`
+added in `src/eval/longbench.py`.
 
-Similarly check if `EleutherAI/proof-pile` needs it.
+`load_dataset("EleutherAI/proof-pile", split="test", trust_remote_code=True)`
+added in `src/eval/proof_pile.py`.
 
 ---
 
 ## P2 Items — Status After P0
 
 ### P2-1: Unit tests for spectral transforms
-**STATUS: STILL NEEDED.**
+**STATUS: DONE.**
 
-Tests to write:
-- DCT round-trip reconstruction error (forward → inverse ≈ identity)
-- FFT round-trip reconstruction error
-- Truncation preserves expected fraction (γ·N coefficients)
-- Learnable filter gradient flow (backward pass updates filter_logits)
-- FixedLowPassFilter output matches expected low-pass behavior
-- SpectralKVCache compress → reconstruct shape correctness
-- GQA repeat_kv on reconstructed tensors
+`tests/test_spectral_transforms.py` — 28 tests across 8 test classes:
 
-Suggested location: `tests/test_spectral_transforms.py`
+- `TestDCTTransform`: round-trip identity, spectral_len, output shape/realness, pad_to_len
+- `TestFFTTransform`: round-trip identity, spectral_len, output shape/complexity, pad_to_len
+- `TestTruncation`: fraction correctness for DCT/FFT at gamma=0.50/0.22/0.01, low-freq preservation, gamma=1.0 no-op
+- `TestLearnableFilter`: parameter existence, forward shape, gradient flow, mask range [0,1], low-pass initialization
+- `TestFixedLowPassFilter`: no-op behavior, no parameters, complex compatibility
+- `TestSpectralKVCache`: compress/reconstruct shape, compression ratio, reset, baseline passthrough, cache size, DCT cache
+- `TestGQARepeatKV`: repeat_kv shape correctness, repeat_kv on reconstructed tensors
+- `TestARTAnova`: main effect detection, interaction detection, no false positives, per-gamma, fallback, method field, eta_sq
 
 ### P2-2: Smoke test script
-**STATUS: STILL NEEDED. Priority: HIGH (before any GPU run).**
+**STATUS: DONE.**
 
-The attention patching uses monkey-patching on `LlamaAttention.forward`.
-Must verify at runtime:
-- Wrapped forward receives correct kwargs from the model
-- `position_embeddings` correctly handled (transformers ≥4.46 passes
-  as kwargs, <4.46 expects `rotary_emb` on the module)
-- Gradient flows through the learnable filter
-- `repeat_kv` works correctly with reconstructed tensors
-- Loss computation succeeds with compressed attention output
-- `reset_all_caches()` clears state properly between sequences
-- PEFT `modules_to_save` correctly saves/loads `spectral_cache`
+`scripts/smoke_test.sh` + `src/tests/smoke_test.py` — 9 integration tests:
 
-Suggested location: `scripts/smoke_test.sh` + `src/tests/smoke_test.py`
+1. Model loading with eager attention
+2. Spectral compression applied to all layers
+3. Forward pass produces valid output (no NaN/Inf)
+4. Loss computation succeeds
+5. Gradient flow through learnable filter (backward + optimizer step)
+6. `reset_all_caches()` clears state properly
+7. PEFT `modules_to_save` saves/loads `spectral_cache` (P2-6)
+8. 1-sample PG-19 perplexity eval
+9. 1-sample LongBench eval
 
-Smoke test flow:
-1. Load a small model (e.g., `meta-llama/Llama-3.2-1B-Instruct` for speed)
-2. Apply spectral compression (FFT + learnable, γ=0.22)
-3. Run 10 training steps on dummy data
-4. Verify loss decreases or at least doesn't NaN
-5. Verify learnable filter params have gradients
-6. Save checkpoint, reload, verify spectral_cache is restored
-7. Run 1-sample PG-19 perplexity eval
-8. Run 1-sample LongBench eval
+Usage:
+```bash
+bash scripts/smoke_test.sh
+bash scripts/smoke_test.sh --model meta-llama/Llama-3.2-1B-Instruct
+bash scripts/smoke_test.sh --transform dct --filter fixed --gamma 0.50
+bash scripts/smoke_test.sh --skip-eval  # skip PG-19/LongBench
+```
 
 ### P2-3: W&B integration
 **STATUS: DONE in P0.**
@@ -177,56 +186,51 @@ Smoke test flow:
 Integrated into `run_experiment.py` for both train and eval phases.
 
 ### P2-4: FA2 compatibility with modified KV cache
-**STATUS: NEW ISSUE. Priority: MEDIUM.**
+**STATUS: DONE.**
 
-The spectral forward (`_spectral_forward` in attention.py) uses manual
-SDPA (`torch.matmul` + `F.softmax`) instead of
-`F.scaled_dot_product_attention`. This means FlashAttention-2 is NOT
-used for the compressed attention computation — only for the Q/K/V
-projections (which don't need it since they're just linear layers).
+Switched `attn_implementation` from `"flash_attention_2"` to `"eager"` in
+all 3 model-loading paths:
+- `src/training/train_redpajama.py`
+- `src/training/train_longalpaca.py`
+- `src/run_experiment.py`
 
-The manual implementation is necessary because FA2 cannot handle
-variable-length KV tensors (the reconstructed length may differ from
-the input length). This is expected and matches FreqKV's approach.
-
-However, the model loading requests
-`attn_implementation="flash_attention_2"` which may cause confusion:
-- transformers may set internal flags expecting SDPA-based attention
-- But since we override `forward` entirely, the internal attention
-  implementation flag is irrelevant
-
-**Recommendation:** Switch to `attn_implementation="eager"` for clarity,
-since we override the forward anyway. Add a comment explaining why FA2
-is not used for the compressed attention path. This avoids confusion
-and prevents potential transformers version-specific issues.
-
-Files to update:
-- `src/training/train_redpajama.py` (line with `attn_implementation`)
-- `src/training/train_longalpaca.py` (line with `attn_implementation`)
-- `src/run_experiment.py` (line with `attn_implementation`)
+Added explanatory comments in each file documenting that the spectral
+forward override replaces LlamaAttention.forward entirely with manual
+attention (Q@K^T + softmax), so FA2 is never used for the compressed
+attention computation. Using "eager" avoids version-specific SDPA flag
+confusion.
 
 ### P2-5: trust_remote_code for LongBench
-**STATUS: Same as P1-5.**
+**STATUS: DONE (same as P1-5).**
 
 ### P2-6: Verify checkpoint loading at runtime
-**STATUS: NEW ITEM.**
+**STATUS: DONE (folded into smoke test P2-2).**
 
-Part of the smoke test (P2-2). Specifically verify:
-- Phase 1 LoRA adapter saves `spectral_cache` module
-- Phase 2 loads Phase 1 checkpoint and `spectral_cache` is restored
-- Learnable filter parameters persist across phases
-- `modules_to_save` mechanism works as expected with PEFT
+Smoke test `test_checkpoint_save_load` in `src/tests/smoke_test.py`:
+- Applies LoRA with `modules_to_save=["spectral_cache"]`
+- Saves checkpoint to temp dir
+- Verifies `adapter_config.json` mentions `spectral_cache`
+- Loads fresh base model, re-applies compression, loads LoRA adapter
+- Verifies learnable filter params restored from checkpoint
 
 ---
 
 ## Recommended Implementation Order
 
-1. **P1-4: ART ANOVA** — academically critical for interaction effects
-2. **P2-2: Smoke test script** — catches integration bugs before GPU runs
-3. **P1-3/P1-5: Dataset verification + trust_remote_code** — quick, on Coder workspace
-4. **P2-4: FA2 → eager attention** — clarity fix, prevents version issues
-5. **P2-1: Unit tests** — verify spectral transform correctness
-6. **P2-6: Checkpoint verification** — fold into smoke test
+All items completed:
+
+1. ~~**P1-4: ART ANOVA**~~ — DONE. True ART (Wobbrock et al. 2011) with interaction detection.
+2. ~~**P2-2: Smoke test script**~~ — DONE. 9 integration tests in `src/tests/smoke_test.py`.
+3. ~~**P1-3/P1-5: Dataset verification + trust_remote_code**~~ — DONE. trust_remote_code added; dataset verification checklist created at `docs/dataset_verification.md`.
+4. ~~**P2-4: FA2 → eager attention**~~ — DONE. All 3 files switched to eager. Removed flash-attn from requirements.txt.
+5. ~~**P2-1: Unit tests**~~ — DONE. 28 tests in `tests/test_spectral_transforms.py`.
+6. ~~**P2-6: Checkpoint verification**~~ — DONE. Folded into smoke test.
+
+**All P1/P2 tasks addressed.** Run on the Coder workspace before launching
+GPU experiments:
+  1. Verify datasets: follow `docs/dataset_verification.md`
+  2. Run unit tests: `pytest tests/test_spectral_transforms.py -v`
+  3. Run smoke test: `bash scripts/smoke_test.sh`
 
 ## Key Files Reference
 

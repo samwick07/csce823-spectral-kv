@@ -1,4 +1,4 @@
-"""LoRA configuration for fine-tuning Llama-3.1-8B-Instruct.
+"""LoRA configuration for fine-tuning the project's base model.
 
 Following FreqKV's protocol: LoRA rank 8, targeting attention projection layers.
 The learnable spectral filter parameters are preserved via modules_to_save
@@ -17,7 +17,7 @@ def create_lora_config(
     target_modules: list[str] | None = None,
     modules_to_save: list[str] | None = None,
 ) -> LoraConfig:
-    """Create LoRA configuration for Llama-3.1-8B-Instruct.
+    """Create LoRA configuration for the base model.
 
     LoRA adapters are applied to attention projections (q, k, v, o).
     The learnable spectral filter parameters are saved as full-precision

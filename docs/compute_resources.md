@@ -23,7 +23,7 @@
 
 ## 2. Model Memory Footprint
 
-### Llama-3-8B-Instruct
+### Llama-3.1-8B-Instruct
 
 | Component                  | Size (BF16)   | Notes                         |
 |---------------------------|---------------|-------------------------------|
@@ -49,7 +49,7 @@
 
 ### Conclusion: 8× H200 is Overkill for Training (Intentionally)
 
-Training Llama-3-8B with LoRA r=8 is comfortable on 4× H200. With 8× H200, you have
+Training Llama-3.1-8B with LoRA r=8 is comfortable on 4× H200. With 8× H200, you have
 two options:
 
 1. **Use all 8 GPUs for training** — faster throughput, larger effective batch
@@ -82,7 +82,7 @@ GPUs independently (1 config per GPU, seeds run sequentially within each).
 
 Training must be sequential (each config uses all 8 GPUs via DeepSpeed).
 However, the baseline (C00) doesn't need spectral compression training — it
-can use the stock Llama-3-8B-Instruct checkpoint, saving ~6 hours.
+can use the stock Llama-3.1-8B-Instruct checkpoint, saving ~6 hours.
 
 **Adjusted training estimate: ~64-78 hours (~2.7-3.3 days)**
 
@@ -162,7 +162,7 @@ to the full 1,200+ GPU-hour run.
 
 | Item                          | Size          |
 |------------------------------|---------------|
-| Base model (Llama-3-8B)      | ~16 GB        |
+| Base model (Llama-3.1-8B)     | ~16 GB        |
 | LoRA checkpoints (14 configs)| ~300 MB total |
 | HuggingFace dataset cache     | ~50 GB        |
 | Evaluation results (JSON)    | ~500 MB       |
@@ -202,7 +202,7 @@ Network is not a bottleneck thanks to NVLink 4.0 and CCR's high-speed internet.
 ### Phase A: Environment Setup (Day 0)
 1. Verify 8× H200 visibility: `nvidia-smi`
 2. Create venv, install requirements.txt
-3. HuggingFace login (request Llama-3 access if not already approved)
+3. HuggingFace login (request Llama-3.1 access if not already approved)
 4. Pre-download datasets: RedPajama, LongAlpaca-16k, PG-19, Proof-pile, LongBench
 5. Smoke test: load model, run 10-step training, run 1-sample eval
 

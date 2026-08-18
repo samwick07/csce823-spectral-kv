@@ -40,3 +40,5 @@ Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
+sfactory.config.yaml
+.sfactory/

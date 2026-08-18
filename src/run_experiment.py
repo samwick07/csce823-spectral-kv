@@ -123,12 +123,14 @@ def run_evaluation(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. Load base model
+    # 2. Load base model with eager attention.
+    #    Spectral forward overrides LlamaAttention.forward entirely with
+    #    manual attention, so FA2 is never used for compressed computation.
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         token=hf_token,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="eager",
         device_map="auto",
     )
 

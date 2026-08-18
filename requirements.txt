@@ -3,7 +3,8 @@ torch>=2.2
 transformers>=4.43
 peft>=0.12
 deepspeed>=0.15
-flash-attn>=2.6
+# Note: flash-attn removed — spectral forward overrides LlamaAttention.forward
+# with manual SDPA, incompatible with FlashAttention kernels. Using eager attention.
 datasets>=2.20
 accelerate>=0.34
 

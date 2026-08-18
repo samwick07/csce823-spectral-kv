@@ -378,10 +378,40 @@ def _art_anova(df: pd.DataFrame) -> dict:
       - Factor B: Filter (Fixed vs Learnable)
       - Interaction: A x B
 
-    Uses a simplified ART implementation via rank transformation.
-    For full ART, use the ARTool R package or py-art library.
+    Implements the ART procedure from Wobbrock et al. (2011), "The Aligned
+    Rank Transform for Nonparametric Factorial Analyses Using Only ANOVA
+    Procedures" (CHI '11). The procedure:
+
+    1. Compute aligned observations for each effect by removing the estimated
+       effects of all *other* factors and interactions.
+    2. Rank the aligned observations (average ranks for ties).
+    3. Run standard one-way ANOVA (F-test) on the ranks.
+
+    This correctly detects interaction effects -- the core research question
+    of whether the benefit of learnable filtering depends on transform type --
+    which the previous per-factor Kruskal-Wallis approach could not.
+
+    Alignment formulas for a 2-factor design (A = transform, B = filter):
+      Grand mean:              y_bar
+      A marginal mean:         y_Ai   = mean over all B for level A_i
+      B marginal mean:         y_Bj   = mean over all A for level B_j
+      Cell mean:               y_AiBj = mean for (A_i, B_j)
+
+      Aligned for A:    Y'_A  = Y - y_AiBj + y_Ai
+      Aligned for B:    Y'_B  = Y - y_AiBj + y_Bj
+      Aligned for A×B:  Y'_AB = Y - y_Ai - y_Bj + y_bar
+
+    The analysis is run per benchmark (collapsing across gamma levels) and
+    also per (benchmark, gamma) combination for finer-grained insight.
+    Kruskal-Wallis per-factor results are retained as a sanity-check fallback.
     """
-    results = {"main_effects": {}, "interaction": {}}
+    results = {
+        "main_effects": {},
+        "interaction": {},
+        "per_gamma": {},
+        "kruskal_wallis_fallback": {},
+        "method": "aligned_rank_transform (Wobbrock et al. 2011)",
+    }
 
     # Filter to non-baseline configs (the 2x2 design space)
     factorial_df = df[
@@ -393,51 +423,210 @@ def _art_anova(df: pd.DataFrame) -> dict:
         logger.warning("No factorial design data found for ART ANOVA")
         return results
 
+    # ------------------------------------------------------------------
+    # Helper: run ART for a single subset of data
+    # ------------------------------------------------------------------
+    def _run_art(sub_df: pd.DataFrame, label: str) -> dict:
+        """Run the 3-effect ART (A, B, A×B) on a data subset.
+
+        Returns a dict with keys 'A', 'B', 'AB', each mapping to a result
+        dict or None if insufficient data.
+        """
+        out = {}
+
+        if len(sub_df) < 4:
+            return out
+
+        # Compute means
+        grand_mean = sub_df["value"].mean()
+        transform_means = sub_df.groupby("transform")["value"].mean()
+        filter_means = sub_df.groupby("filter")["value"].mean()
+        cell_means = sub_df.groupby(["transform", "filter"])["value"].mean()
+
+        # Aligned observations
+        def align_A(row):
+            cell = cell_means.get((row["transform"], row["filter"]))
+            marg = transform_means.get(row["transform"])
+            if cell is None or marg is None or pd.isna(cell) or pd.isna(marg):
+                return float("nan")
+            return row["value"] - cell + marg
+
+        def align_B(row):
+            cell = cell_means.get((row["transform"], row["filter"]))
+            marg = filter_means.get(row["filter"])
+            if cell is None or marg is None or pd.isna(cell) or pd.isna(marg):
+                return float("nan")
+            return row["value"] - cell + marg
+
+        def align_AB(row):
+            marg_A = transform_means.get(row["transform"])
+            marg_B = filter_means.get(row["filter"])
+            if marg_A is None or marg_B is None or pd.isna(marg_A) or pd.isna(marg_B):
+                return float("nan")
+            return row["value"] - marg_A - marg_B + grand_mean
+
+        sub_df = sub_df.copy()
+        sub_df["_aligned_A"] = sub_df.apply(align_A, axis=1)
+        sub_df["_aligned_B"] = sub_df.apply(align_B, axis=1)
+        sub_df["_aligned_AB"] = sub_df.apply(align_AB, axis=1)
+
+        # Drop rows with NaN aligned values (incomplete cells)
+        sub_df = sub_df.dropna(subset=["_aligned_A", "_aligned_B", "_aligned_AB"])
+
+        if len(sub_df) < 4:
+            return out
+
+        # Rank the aligned observations (average ranks for ties)
+        ranked_A = stats.rankdata(sub_df["_aligned_A"].values)
+        ranked_B = stats.rankdata(sub_df["_aligned_B"].values)
+        ranked_AB = stats.rankdata(sub_df["_aligned_AB"].values)
+
+        # --- Effect A (transform) ---
+        groups_A = [
+            ranked_A[sub_df["transform"].values == t]
+            for t in sorted(sub_df["transform"].unique())
+        ]
+        if len(groups_A) >= 2 and all(len(g) >= 2 for g in groups_A):
+            f_stat, p_val = stats.f_oneway(*groups_A)
+            grand_rank = ranked_A.mean()
+            ss_between = sum(len(g) * (g.mean() - grand_rank) ** 2 for g in groups_A)
+            ss_total = ((ranked_A - grand_rank) ** 2).sum()
+            ss_error = ss_total - ss_between
+            denom = ss_between + ss_error
+            eta_sq = float(ss_between / denom) if denom > 0 else 0.0
+            out["A"] = {
+                "factor": "transform",
+                "effect_label": label,
+                "method": "ART ANOVA (F-test on aligned ranks)",
+                "f_statistic": float(f_stat),
+                "p_value": float(p_val),
+                "significant": p_val < ALPHA,
+                "partial_eta_squared": eta_sq,
+                "df_between": len(groups_A) - 1,
+                "df_within": len(sub_df) - len(groups_A),
+                "n_observations": len(sub_df),
+            }
+
+        # --- Effect B (filter) ---
+        groups_B = [
+            ranked_B[sub_df["filter"].values == f]
+            for f in sorted(sub_df["filter"].unique())
+        ]
+        if len(groups_B) >= 2 and all(len(g) >= 2 for g in groups_B):
+            f_stat, p_val = stats.f_oneway(*groups_B)
+            grand_rank = ranked_B.mean()
+            ss_between = sum(len(g) * (g.mean() - grand_rank) ** 2 for g in groups_B)
+            ss_total = ((ranked_B - grand_rank) ** 2).sum()
+            ss_error = ss_total - ss_between
+            denom = ss_between + ss_error
+            eta_sq = float(ss_between / denom) if denom > 0 else 0.0
+            out["B"] = {
+                "factor": "filter",
+                "effect_label": label,
+                "method": "ART ANOVA (F-test on aligned ranks)",
+                "f_statistic": float(f_stat),
+                "p_value": float(p_val),
+                "significant": p_val < ALPHA,
+                "partial_eta_squared": eta_sq,
+                "df_between": len(groups_B) - 1,
+                "df_within": len(sub_df) - len(groups_B),
+                "n_observations": len(sub_df),
+            }
+
+        # --- Effect A×B (interaction) ---
+        interaction_labels = sub_df["transform"].values + ":" + sub_df["filter"].values
+        unique_interactions = sorted(set(interaction_labels))
+        groups_AB = [
+            ranked_AB[interaction_labels == g]
+            for g in unique_interactions
+        ]
+        if len(groups_AB) >= 2 and all(len(g) >= 2 for g in groups_AB):
+            f_stat, p_val = stats.f_oneway(*groups_AB)
+            grand_rank = ranked_AB.mean()
+            ss_between = sum(len(g) * (g.mean() - grand_rank) ** 2 for g in groups_AB)
+            ss_total = ((ranked_AB - grand_rank) ** 2).sum()
+            ss_error = ss_total - ss_between
+            denom = ss_between + ss_error
+            eta_sq = float(ss_between / denom) if denom > 0 else 0.0
+            out["AB"] = {
+                "factor": "transform:filter",
+                "effect_label": label,
+                "method": "ART ANOVA (F-test on aligned ranks)",
+                "f_statistic": float(f_stat),
+                "p_value": float(p_val),
+                "significant": p_val < ALPHA,
+                "partial_eta_squared": eta_sq,
+                "df_between": len(groups_AB) - 1,
+                "df_within": len(sub_df) - len(groups_AB),
+                "n_observations": len(sub_df),
+                "levels": unique_interactions,
+            }
+
+        return out
+
+    # ------------------------------------------------------------------
+    # Main analysis: per benchmark, collapsing across gamma
+    # ------------------------------------------------------------------
     for benchmark in factorial_df["benchmark"].unique():
         bench_df = factorial_df[factorial_df["benchmark"] == benchmark]
+        label = f"{benchmark}"
+        art = _run_art(bench_df, label)
 
-        # Simplified: use Kruskal-Wallis as a non-parametric alternative
-        # for each factor and the interaction
+        if "A" in art:
+            results["main_effects"][f"transform_{benchmark}"] = art["A"]
+        if "B" in art:
+            results["main_effects"][f"filter_{benchmark}"] = art["B"]
+        if "AB" in art:
+            results["interaction"][f"transform_x_filter_{benchmark}"] = art["AB"]
+
+    # ------------------------------------------------------------------
+    # Per-gamma analysis: does the interaction vary with compression?
+    # ------------------------------------------------------------------
+    for benchmark in factorial_df["benchmark"].unique():
+        for gamma in [0.50, 0.22, 0.01]:
+            subset = factorial_df[
+                (factorial_df["benchmark"] == benchmark) &
+                (factorial_df["gamma"] == gamma)
+            ]
+            if len(subset) < 4:
+                continue
+            label = f"{benchmark}_gamma{gamma}"
+            art = _run_art(subset, label)
+            key = label
+            entry = {}
+            if "A" in art:
+                entry["transform"] = art["A"]
+            if "B" in art:
+                entry["filter"] = art["B"]
+            if "AB" in art:
+                entry["interaction"] = art["AB"]
+            if entry:
+                results["per_gamma"][key] = entry
+
+    # ------------------------------------------------------------------
+    # Kruskal-Wallis fallback (sanity check, cannot detect interactions)
+    # ------------------------------------------------------------------
+    for benchmark in factorial_df["benchmark"].unique():
+        bench_df = factorial_df[factorial_df["benchmark"] == benchmark]
         for factor in ["transform", "filter"]:
             groups = []
             labels = []
-            for level in bench_df[factor].unique():
+            for level in sorted(bench_df[factor].unique()):
                 vals = bench_df[bench_df[factor] == level]["value"].values
                 if len(vals) >= 3:
                     groups.append(vals)
                     labels.append(level)
-
             if len(groups) >= 2:
                 stat, pval = stats.kruskal(*groups)
-                results["main_effects"][f"{factor}_{benchmark}"] = {
+                results["kruskal_wallis_fallback"][f"{factor}_{benchmark}"] = {
                     "factor": factor,
                     "benchmark": benchmark,
                     "levels": labels,
                     "statistic": float(stat),
                     "p_value": float(pval),
                     "significant": pval < ALPHA,
+                    "note": "Kruskal-Wallis per-factor; cannot detect interactions",
                 }
-
-        # Interaction: create combined factor
-        bench_df["interaction"] = bench_df["transform"] + ":" + bench_df["filter"]
-        groups = []
-        labels = []
-        for level in bench_df["interaction"].unique():
-            vals = bench_df[bench_df["interaction"] == level]["value"].values
-            if len(vals) >= 3:
-                groups.append(vals)
-                labels.append(level)
-
-        if len(groups) >= 2:
-            stat, pval = stats.kruskal(*groups)
-            results["interaction"][f"transform_x_filter_{benchmark}"] = {
-                "factor": "transform:filter",
-                "benchmark": benchmark,
-                "levels": labels,
-                "statistic": float(stat),
-                "p_value": float(pval),
-                "significant": pval < ALPHA,
-            }
 
     return results
 

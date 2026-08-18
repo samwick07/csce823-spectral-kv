@@ -13,10 +13,10 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from .metrics import compute_sliding_window_perplexity
+from ..utils.constants import DEFAULT_MODEL_NAME
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
 WINDOW_SIZE = 256
 
 
@@ -51,7 +51,7 @@ def evaluate_proof_pile(
     logger.info(f"Evaluating Proof-pile: {num_samples} docs, window={window_size}")
 
     # Load Proof-pile
-    dataset = load_dataset("EleutherAI/proof-pile", split="test")
+    dataset = load_dataset("EleutherAI/proof-pile", split="test", trust_remote_code=True)
 
     # Select samples
     torch.manual_seed(seed)

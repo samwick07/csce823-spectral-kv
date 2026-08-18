@@ -89,8 +89,8 @@ class DCTTransform(SpectralTransform):
     """Discrete Cosine Transform (DCT-II) for KV-cache compression.
 
     This is the FreqKV baseline transform. The DCT is real-valued and
-    discards phase information. Implemented via torch.fft for efficiency
-    using the FFT-based DCT algorithm.
+    discards phase information. Implemented via torch.fft.dct / idct
+    (available in PyTorch >= 2.1) or a manual FFT-based DCT algorithm.
 
     The DCT produces N real coefficients for a length-N input. After
     truncation to gamma*N coefficients, the inverse DCT must zero-pad
@@ -100,36 +100,55 @@ class DCTTransform(SpectralTransform):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply DCT-II along the sequence dimension.
 
-        Uses the standard FFT-based DCT algorithm:
-        DCT(x) = Re(FFT(x_reordered)) * phase_factors
+        Uses the standard interleaving trick to compute DCT-II via FFT.
+        Returns N real coefficients for a length-N input.
+
+        The interleaving permutation v = [x_0, x_2, ..., x_{N-1},
+        x_{N-2}, ..., x_1] is applied via index_select along self.dim
+        (NOT ``x[..., 0::2]`` which would slice the last dimension).
         """
         N = x.shape[self.dim]
+        dim = self.dim if self.dim >= 0 else x.ndim + self.dim
 
-        # Rearrange for FFT-based DCT: [x0, x2, x4, ..., x5, x3, x1]
-        # This is the standard "interleave" trick for DCT via FFT
-        v = torch.cat([x[..., 0::2], x[..., 1::2].flip(self.dim)], dim=self.dim)
+        # Interleave: v = [x_0, x_2, x_4, ..., x_{N-1}, x_{N-2}, ..., x_1]
+        even_idx = torch.arange(0, N, 2, device=x.device)
+        odd_idx = torch.arange(1, N, 2, device=x.device)
+        perm = torch.cat([even_idx, odd_idx.flip(0)])
+        v = x.index_select(dim, perm)
 
         # Apply complex FFT
-        V = torch.fft.fft(v, dim=self.dim)
+        V = torch.fft.fft(v, dim=dim)
 
-        # Multiply by phase factors to get DCT
+        # Multiply by phase factors to get DCT-II coefficients
         k = torch.arange(N, device=x.device, dtype=x.dtype)
         phase = torch.exp(-1j * torch.pi * k / (2 * N))
-
-        # Reshape phase for broadcasting
         shape = [1] * x.ndim
-        shape[self.dim] = N
+        shape[dim] = N
         phase = phase.reshape(shape)
 
         dct = (V * phase).real
-
         return dct
 
     def inverse(self, x_spectral: torch.Tensor, target_len: int) -> torch.Tensor:
         """Apply inverse DCT (DCT-III) to reconstruct the spatial tensor.
 
-        If x_spectral has been truncated to fewer coefficients than target_len,
-        we zero-pad back to target_len before applying the inverse DCT.
+        If x_spectral has been truncated to fewer coefficients than
+        target_len, we zero-pad back to target_len before applying the
+        inverse.
+
+        The forward DCT-II computes X_k = Re(W_k) where
+        W_k = exp(-j*pi*k/(2N)) * FFT(v)_k and v is the interleaved
+        permutation of x.  Since v is real, FFT(v) has Hermitian
+        symmetry, which constrains the imaginary part of W_k:
+
+            Im(W_k) = -X_{N-k}   for k = 1 .. N-1
+            Im(W_0) = 0
+
+        So W_k = X_k - j*X_{N-k} (with X_mirror[0]=0), and we recover
+        v = IFFT(W * exp(j*pi*k/(2N))) which is guaranteed real by the
+        Hermitian symmetry of the reconstructed spectrum.  No X_0
+        scaling or 2x factor is needed — this is an exact
+        reconstruction, not the normalized DCT-III formula.
 
         Args:
             x_spectral: Spectral representation (possibly truncated).
@@ -144,29 +163,50 @@ class DCTTransform(SpectralTransform):
             padding = torch.zeros(pad_shape, device=x_spectral.device, dtype=x_spectral.dtype)
             x_spectral = torch.cat([x_spectral, padding], dim=self.dim)
         elif current_len > target_len:
-            # Truncate to target_len (shouldn't happen, but be safe)
             x_spectral = x_spectral.narrow(self.dim, 0, target_len)
 
         N = target_len
+        dim = self.dim if self.dim >= 0 else x_spectral.ndim + self.dim
 
-        # DCT-III via FFT
+        # Build the mirror index: X_mirror[k] = X_{N-k} for k=1..N-1, 0 for k=0
+        # mirror_idx = [0, N-1, N-2, ..., 1]
+        mirror_idx = torch.cat([
+            torch.zeros(1, dtype=torch.long, device=x_spectral.device),
+            torch.arange(N - 1, 0, -1, device=x_spectral.device),
+        ])
+        X_mirror = x_spectral.index_select(dim, mirror_idx)
+        # Zero out position 0 (Im(W_0) = 0)
+        zero_sel = [slice(None)] * x_spectral.ndim
+        zero_sel[dim] = 0
+        X_mirror[tuple(zero_sel)] = 0
+
+        # Reconstruct complex spectrum: W = X - j * X_mirror
+        W = torch.complex(x_spectral, -X_mirror)
+
+        # Apply phase: V = W * exp(j*pi*k/(2N))
         k = torch.arange(N, device=x_spectral.device, dtype=x_spectral.dtype)
         phase = torch.exp(1j * torch.pi * k / (2 * N))
-
         shape = [1] * x_spectral.ndim
-        shape[self.dim] = N
+        shape[dim] = N
         phase = phase.reshape(shape)
+        V = W * phase
 
-        V = torch.fft.ifft(x_spectral * phase, dim=self.dim)
+        # IFFT to get interleaved permutation (guaranteed real by construction)
+        v = torch.fft.ifft(V, dim=dim)
 
-        # Undo the interleaving
-        half = (target_len + 1) // 2
-        x = torch.empty(
-            *x_spectral.shape[:-1], target_len,
-            device=x_spectral.device, dtype=V.real.dtype,
-        )
-        x[..., 0::2] = V[..., :half].real
-        x[..., 1::2] = V[..., half:].real.flip(self.dim)
+        # Undo interleaving: v = [x_0, x_2, ..., x_{N-1}, x_{N-2}, ..., x_1]
+        half = (N + 1) // 2
+        even_idx = torch.arange(0, N, 2, device=x_spectral.device)
+        odd_idx = torch.arange(1, N, 2, device=x_spectral.device)
+        x = torch.empty_like(x_spectral)
+        even_sel = [slice(None)] * x_spectral.ndim
+        even_sel[dim] = even_idx
+        odd_sel = [slice(None)] * x_spectral.ndim
+        odd_sel[dim] = odd_idx
+        v_first = v.narrow(dim, 0, half)
+        v_second = v.narrow(dim, half, N - half)
+        x[tuple(even_sel)] = v_first.real
+        x[tuple(odd_sel)] = v_second.real.flip(dim)
 
         return x
 
