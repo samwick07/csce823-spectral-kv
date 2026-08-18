@@ -1,0 +1,42 @@
+# Results and checkpoints
+results/
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+csce823-venv/
+
+# Experiment tracking
+wandb/
+runs/
+tb_logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# HuggingFace cache
+.cache/
+
+# Jupyter
+.ipynb_checkpoints/

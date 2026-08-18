@@ -1,0 +1,28 @@
+# Core ML
+torch>=2.2
+transformers>=4.43
+peft>=0.12
+deepspeed>=0.15
+flash-attn>=2.6
+datasets>=2.20
+accelerate>=0.34
+
+# Evaluation
+lm-eval>=0.4
+
+# Statistical analysis
+scipy>=1.14
+statsmodels>=0.14
+scikit-posthocs>=0.10
+matplotlib>=3.9
+seaborn>=0.13
+
+# Experiment tracking
+wandb
+tensorboard
+
+# Utilities
+tqdm
+pandas
+pyyaml
+numpy
