@@ -1,6 +1,6 @@
 """Smoke test for the spectral KV-cache compression pipeline.
 
-Runs on GPU with a small model to verify the full integration:
+Runs on GPU with the experiment model to verify the full integration:
   1. Model loads with eager attention
   2. Spectral compression applies to all layers
   3. Forward pass with compression produces valid output
@@ -13,10 +13,11 @@ Runs on GPU with a small model to verify the full integration:
 
 Usage:
     python -m src.tests.smoke_test
-    python -m src.tests.smoke_test --model meta-llama/Llama-3.2-1B-Instruct
+    python -m src.tests.smoke_test --model meta-llama/Llama-3.1-8B-Instruct
     python -m src.tests.smoke_test --transform fft --filter learnable --gamma 0.22
 
-Model defaults to SMOKE_TEST_MODEL_NAME from src/utils/constants.py.
+Model defaults to SMOKE_TEST_MODEL_NAME from src/utils/constants.py
+(same as DEFAULT_MODEL_NAME — the 8B experiment model).
 
 Designed to run on the Coder workspace (coder.afitcdn.org) with GPU access.
 """

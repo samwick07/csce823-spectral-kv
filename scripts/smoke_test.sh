@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Smoke test runner for spectral KV-cache compression.
 #
-# Runs the full integration test with the small smoke-test model
-# (default: Llama-3.2-1B-Instruct, see src/utils/constants.py)
+# Runs the full integration test with the experiment model
+# (Llama-3.1-8B-Instruct, see src/utils/constants.py)
 # to verify the spectral compression pipeline works end-to-end before
 # launching expensive GPU experiments.
 #
 # Usage:
 #   bash scripts/smoke_test.sh
-#   bash scripts/smoke_test.sh --model meta-llama/Llama-3.2-1B-Instruct
+#   bash scripts/smoke_test.sh --model meta-llama/Llama-3.1-8B-Instruct
 #   bash scripts/smoke_test.sh --transform dct --filter fixed --gamma 0.50
 #   bash scripts/smoke_test.sh --skip-eval  # skip PG-19/LongBench (no network)
 
