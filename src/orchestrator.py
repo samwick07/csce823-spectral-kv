@@ -159,14 +159,29 @@ def get_phase2_checkpoint(config_id: str) -> str | None:
 # Subprocess runner
 # ---------------------------------------------------------------------------
 
-def run_subprocess(cmd: list[str], timeout: int = 36000) -> bool:
+def run_subprocess(
+    cmd: list[str],
+    timeout: int = 36000,
+    env: dict[str, str] | None = None,
+    log_prefix: str = "",
+) -> bool:
     """Run a subprocess, log output, return True on success.
 
     Respects _shutdown_requested: if set, waits for the current
     subprocess to finish then returns False.
+
+    Args:
+        cmd: Command list to execute.
+        timeout: Maximum seconds to wait.
+        env: Optional environment overrides (merged with os.environ).
+        log_prefix: Prefix for log lines (e.g., "[GPU0] ").
     """
     cmd_str = " ".join(cmd)
-    logger.info(f"Running: {cmd_str}")
+    logger.info(f"{log_prefix}Running: {cmd_str}")
+
+    full_env = os.environ.copy()
+    if env:
+        full_env.update(env)
 
     try:
         proc = subprocess.Popen(
@@ -176,25 +191,26 @@ def run_subprocess(cmd: list[str], timeout: int = 36000) -> bool:
             cwd=str(PROJECT_ROOT),
             text=True,
             bufsize=1,
+            env=full_env,
         )
     except Exception as e:
-        logger.error(f"Failed to start subprocess: {e}")
+        logger.error(f"{log_prefix}Failed to start subprocess: {e}")
         return False
 
     # Stream output to logger
     for line in proc.stdout:  # type: ignore[union-attr]
         line = line.rstrip()
         if line:
-            logger.info(f"  | {line}")
+            logger.info(f"{log_prefix}  | {line}")
 
     proc.wait(timeout=timeout)
 
     if proc.returncode != 0:
-        logger.error(f"Subprocess failed with exit code {proc.returncode}")
+        logger.error(f"{log_prefix}Subprocess failed with exit code {proc.returncode}")
         return False
 
     if _shutdown_requested:
-        logger.warning("Shutdown requested. Stopping after this subprocess.")
+        logger.warning(f"{log_prefix}Shutdown requested. Stopping after this subprocess.")
         return False
 
     return True
@@ -275,23 +291,7 @@ def eval_config_seed(
     # Get checkpoint (None for baseline C00)
     checkpoint = get_phase2_checkpoint(config_id)
 
-    cmd = [
-        sys.executable,
-        "-c",
-        f"import os; os.environ['CUDA_VISIBLE_DEVICES']='{gpu_id}'; "
-        f"exec(open('src/run_experiment.py').read())",
-        "--config", str(config_file),
-        "--mode", "eval",
-        "--seed", str(seed),
-    ]
-    if checkpoint:
-        cmd.extend(["--checkpoint", checkpoint])
-    if hf_token:
-        cmd.extend(["--hf-token", hf_token])
-
-    # Use direct python call instead of the hacky -c approach
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    env = {"CUDA_VISIBLE_DEVICES": str(gpu_id)}
 
     cmd = [
         sys.executable, "src/run_experiment.py",
@@ -305,7 +305,7 @@ def eval_config_seed(
         cmd.extend(["--hf-token", hf_token])
 
     logger.info(f"[{config_id} seed={seed} GPU={gpu_id}] Starting eval")
-    success = run_subprocess(cmd)
+    success = run_subprocess(cmd, env=env, log_prefix=f"[GPU{gpu_id}]")
 
     if success and is_eval_complete(config_id, seed):
         logger.info(f"[{config_id} seed={seed}] Eval complete.")
@@ -484,24 +484,70 @@ def run_full_sweep(
                     break
 
                 batch = remaining_seeds[batch_start:batch_start + batch_size]
-                processes = []
+                logger.info(f"[{config_id}] Launching batch of {len(batch)} "
+                            f"evals on GPUs 0-{len(batch)-1}")
+
+                # Launch all evals in this batch as parallel subprocesses
+                procs: list[tuple[int, int, subprocess.Popen]] = []  # (seed, gpu_id, proc)
 
                 for gpu_id, seed in enumerate(batch):
                     task = f"eval_{config_id}_seed{seed}"
                     state["current_task"] = task
                     save_state(state)
 
-                    # For sequential simplicity (and crash safety), run one
-                    # eval at a time per GPU, cycling through GPUs.
-                    # Full parallelism is handled by the outer loop.
-                    success = eval_config_seed(config_id, seed, hf_token, gpu_id)
+                    config_file = CONFIGS_DIR / f"experiment_{config_id}.yaml"
+                    checkpoint = get_phase2_checkpoint(config_id)
 
-                    if success:
+                    cmd = [
+                        sys.executable, "src/run_experiment.py",
+                        "--config", str(config_file),
+                        "--mode", "eval",
+                        "--seed", str(seed),
+                    ]
+                    if checkpoint:
+                        cmd.extend(["--checkpoint", checkpoint])
+                    if hf_token:
+                        cmd.extend(["--hf-token", hf_token])
+
+                    proc_env = os.environ.copy()
+                    proc_env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+                    logger.info(f"[{config_id} seed={seed} GPU={gpu_id}] Starting eval")
+                    try:
+                        p = subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            cwd=str(PROJECT_ROOT),
+                            text=True,
+                            bufsize=1,
+                            env=proc_env,
+                        )
+                        procs.append((seed, gpu_id, p))
+                    except Exception as e:
+                        logger.error(f"[GPU{gpu_id}] Failed to start eval subprocess: {e}")
+                        all_complete = False
+
+                # Wait for all parallel procs to complete, streaming output
+                for seed, gpu_id, p in procs:
+                    try:
+                        for line in p.stdout:  # type: ignore[union-attr]
+                            line = line.rstrip()
+                            if line:
+                                logger.info(f"[GPU{gpu_id}]  | {line}")
+                    except Exception:
+                        pass
+                    p.wait()
+
+                    if p.returncode == 0 and is_eval_complete(config_id, seed):
+                        logger.info(f"[{config_id} seed={seed}] Eval complete.")
                         eval_key = f"{config_id}_seed{seed}"
                         if eval_key not in state["completed_evals"]:
                             state["completed_evals"].append(eval_key)
                         save_state(state)
                     else:
+                        logger.error(f"[{config_id} seed={seed}] Eval incomplete "
+                                     f"(exit={p.returncode}).")
                         all_complete = False
                         if _shutdown_requested:
                             break

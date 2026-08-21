@@ -134,10 +134,13 @@ fi
 ORCH_ARGS=("$@")
 
 # --- Build the command ---
-# Source venv, set env vars, run orchestrator
+# Source venv, set env vars, run orchestrator.
+# WANDB_MODE=offline is set as a fallback: if the network drops mid-run,
+# W&B will buffer logs locally and sync them when connectivity returns.
 COMMAND="source $VENV_DIR/bin/activate && "
 COMMAND+="export HF_TOKEN=\"\${HF_TOKEN:-}\" && "
 COMMAND+="export WANDB_API_KEY=\"\${WANDB_API_KEY:-}\" && "
+COMMAND+="export WANDB_MODE=\"\${WANDB_MODE:-online}\" && "
 COMMAND+="python -m src.orchestrator ${ORCH_ARGS[*]:-}"
 
 LOG_FILE="$LOG_DIR/run_${TIMESTAMP}.log"

@@ -61,14 +61,23 @@ else
     echo -e "${GREEN}HF_TOKEN: set${NC}"
 fi
 
+# Disk space check (need ~200 GB for model + datasets + checkpoints)
+AVAILABLE_GB=$(df -BG --output=avail "$PROJECT_ROOT" | tail -1 | tr -dc '0-9')
+if [[ "$AVAILABLE_GB" -lt 200 ]]; then
+    echo -e "${RED}INSUFFICIENT DISK SPACE: ${AVAILABLE_GB}GB available${NC}"
+    echo -e "${RED}Need at least 200GB for model (16GB) + datasets (50GB) + checkpoints (50GB) + cache${NC}"
+    exit 1
+fi
+echo -e "${GREEN}Disk space: ${AVAILABLE_GB}GB available${NC}"
+
 # --- Create venv ---
 header "CREATING VIRTUAL ENVIRONMENT"
 
 if [[ -d "$VENV_DIR" ]]; then
     echo -e "${YELLOW}venv already exists at $VENV_DIR${NC}"
-    read -p "Recreate? (y/N) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    # Non-interactive: recreate if --force is passed, otherwise keep
+    if [[ "${1:-}" == "--force" ]]; then
+        echo -e "${YELLOW}--force detected, recreating venv...${NC}"
         rm -rf "$VENV_DIR"
     fi
 fi
