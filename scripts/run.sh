@@ -73,6 +73,7 @@ print(f\"  Current task: {s.get('current_task', 'none')}\")
 print(f\"  Training complete: {len(s.get('completed_training', []))} configs\")
 print(f\"  Evals complete: {len(s.get('completed_evals', []))}\")
 print(f\"  Analysis complete: {s.get('completed_analysis', False)}\")
+print(f\"  Exfil complete: {s.get('completed_exfil', False)}\")
 print(f\"  Crash count: {s.get('crash_count', 0)}\")
 "
         else

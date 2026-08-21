@@ -2,6 +2,7 @@
 results/
 checkpoints/
 logs/
+exfil/
 *.bin
 *.safetensors
 *.pt

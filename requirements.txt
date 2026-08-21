@@ -22,6 +22,9 @@ seaborn>=0.13
 wandb
 tensorboard
 
+# Reproducibility (HF Hub upload)
+huggingface_hub>=0.25
+
 # Utilities
 tqdm
 pandas

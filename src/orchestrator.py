@@ -93,6 +93,7 @@ def load_state() -> dict[str, Any]:
         "completed_training": [],
         "completed_evals": [],  # list of "C01_seed0" strings
         "completed_analysis": False,
+        "completed_exfil": False,
         "current_task": None,
         "crash_count": 0,
     }
@@ -569,6 +570,27 @@ def run_full_sweep(
         else:
             all_complete = False
 
+    # --- Phase 4: Exfiltration ---
+    if phase in ("analyze", "full") and not _shutdown_requested and state.get("completed_analysis"):
+        task = "exfil"
+        state["current_task"] = task
+        save_state(state)
+
+        logger.info(f"\n{'='*60}")
+        logger.info(f"  EXFILTRATION (HuggingFace Hub)")
+        logger.info(f"{'='*60}")
+
+        exfil_cmd = ["bash", "scripts/exfil.sh"]
+        exfil_success = run_subprocess(exfil_cmd, log_prefix="[exfil]")
+
+        if exfil_success:
+            state["completed_exfil"] = True
+            save_state(state)
+            logger.info("Exfiltration complete. Results uploaded to HF Hub.")
+        else:
+            all_complete = False
+            logger.warning("Exfiltration failed. Run manually: bash scripts/exfil.sh")
+
     # --- Final state ---
     state["current_task"] = "complete" if all_complete else "interrupted"
     save_state(state)
@@ -580,6 +602,7 @@ def run_full_sweep(
     logger.info(f"  Training complete: {len(state['completed_training'])}/{len(config_ids)}")
     logger.info(f"  Evals complete: {len(state['completed_evals'])}/{len(config_ids) * len(seeds)}")
     logger.info(f"  Analysis complete: {state['completed_analysis']}")
+    logger.info(f"  Exfil complete: {state.get('completed_exfil', False)}")
     logger.info(f"  All work done: {all_complete}")
     logger.info(f"  End: {datetime.now(timezone.utc).isoformat()}")
 
@@ -651,6 +674,7 @@ def main():
         print(f"  Training complete: {state.get('completed_training', [])}")
         print(f"  Evals complete: {len(state.get('completed_evals', []))}")
         print(f"  Analysis complete: {state.get('completed_analysis', False)}")
+        print(f"  Exfil complete: {state.get('completed_exfil', False)}")
         return
 
     # Determine configs and seeds
