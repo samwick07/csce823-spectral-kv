@@ -1,5 +1,5 @@
 # CSCE 823 — Compute Resource Scoping
-## 8× NVIDIA H200 (141 GB HBM3e, 4.8 TB/s) — AFIT CCR AI Cluster
+## 4× NVIDIA H200 (141 GB HBM3e, 4.8 TB/s) — AFIT CCR AI Cluster
 
 **Date:** 2026-08-19
 **Author:** Samuel Chadwick
@@ -64,18 +64,18 @@ GPUs independently (1 config per GPU, seeds run sequentially within each).
 
 | Phase             | Dataset         | Steps/Epochs     | Batch Size | Est. Time (4 GPU) |
 |-------------------|-----------------|------------------|------------|-------------------|
-| Phase 1: CPT      | RedPajama       | 1,000 steps      | 32         | ~3-4 hours        |
-| Phase 2: SFT      | LongAlpaca-16k  | 5 epochs         | 32         | ~6-8 hours        |
+| Phase 1: CPT      | RedPajama       | 1,000 steps      | 64         | ~4-5 hours        |
+| Phase 2: SFT      | LongAlpaca-16k  | 5 epochs         | 64         | ~6-8 hours        |
 | **Total per config** |              |                  |            | **~9-12 hours**   |
 
-### All 14 Configurations
+### All 13 Configurations
 
 | Item                    | Value          |
 |------------------------|----------------|
-| Configurations         | 14 (13 + baseline) |
+| Configurations         | 13 (12 + baseline) |
 | Training time per config | ~9-12 hours   |
-| Sequential training    | ~126-168 hours |
-| **Wall clock (sequential)** | **~5.3-7 days** |
+| Sequential training    | ~117-156 hours |
+| **Wall clock (sequential)** | **~4.9-6.5 days** |
 
 Training must be sequential (each config uses all 4 GPUs via DeepSpeed).
 However, the baseline (C00) doesn't need spectral compression training — it
@@ -101,21 +101,21 @@ can use the stock Llama-3.1-8B-Instruct checkpoint, saving ~12 hours.
 
 | Item                         | Value              |
 |-----------------------------|--------------------|
-| Configurations              | 14                 |
+| Configurations              | 13                 |
 | Seeds per config            | 30                 |
-| Total eval runs             | 420                |
+| Total eval runs             | 390                |
 | Time per eval run (1 GPU)   | ~1.7 hours         |
-| **Total GPU-hours (eval)**  | **~714 GPU-hours** |
+| **Total GPU-hours (eval)**  | **~663 GPU-hours** |
 
 ### Parallelization Across 4 GPUs
 
 | Strategy                    | Wall Clock         |
 |-----------------------------|--------------------|
-| 1 GPU (sequential)          | ~714 hours (~30 days) |
-| 2 GPUs                      | ~357 hours (~15 days) |
-| **4 GPUs (recommended)**    | **~179 hours (~7.5 days)** |
+| 1 GPU (sequential)          | ~663 hours (~27.6 days) |
+| 2 GPUs                      | ~332 hours (~13.8 days) |
+| **4 GPUs (recommended)**    | **~166 hours (~6.9 days)** |
 
-With 4 GPUs, distribute 14 configs across GPUs:
+With 4 GPUs, distribute 13 configs across GPUs:
 - GPU 0: C00 (baseline, fast) + C01 + C02 + C03
 - GPU 1: C04 + C05 + C06
 - GPU 2: C07 + C08 + C09
@@ -127,10 +127,10 @@ With 4 GPUs, distribute 14 configs across GPUs:
 
 | Phase         | GPU-Hours   | Wall Clock (4 GPU)    |
 |--------------|-------------|----------------------|
-| Training     | ~500-624    | ~4.8-6.5 days        |
-| Evaluation   | ~714        | ~7.5 days            |
+| Training     | ~480-600    | ~4.8-6.5 days        |
+| Evaluation   | ~663        | ~6.9 days            |
 | Analysis     | ~2          | ~10 min              |
-| **Total**    | **~1,216-1,340** | **~12.3-14 days** |
+| **Total**    | **~1,145-1,265** | **~11.7-13.4 days** |
 
 ### Pilot Run (Recommended First)
 
@@ -156,7 +156,7 @@ to the full 1,200+ GPU-hour run.
 | Item                          | Size          |
 |------------------------------|---------------|
 | Base model (Llama-3.1-8B)     | ~16 GB        |
-| LoRA checkpoints (14 configs)| ~300 MB total |
+| LoRA checkpoints (13 configs)| ~300 MB total |
 | HuggingFace dataset cache     | ~50 GB        |
 | Evaluation results (JSON)    | ~500 MB       |
 | W&B / TensorBoard logs       | ~5 GB         |
@@ -204,14 +204,14 @@ Network is not a bottleneck thanks to NVLink 4.0 and CCR's high-speed internet.
 3. Estimated time: ~22 hours
 
 ### Phase C: Full Training (Days 2-7)
-1. `bash scripts/run.sh --phase train` — trains all 14 configurations sequentially
-2. ~9-12 hours per config, ~114-156 hours total
+1. `bash scripts/run.sh --phase train` — trains all 13 configurations sequentially
+2. ~9-12 hours per config, ~117-156 hours total
 3. Monitor via `bash scripts/monitor.sh --watch` or W&B dashboard
 
 ### Phase D: Full Evaluation (Days 8-15)
-1. `bash scripts/run.sh --phase eval` — evaluates 14 configs across 4 GPUs
+1. `bash scripts/run.sh --phase eval` — evaluates 13 configs across 4 GPUs
 2. 30 seeds per config, ~1.7 hours per seed
-3. ~179 hours wall clock
+3. ~166 hours wall clock
 4. Monitor via `bash scripts/monitor.sh --watch`
 
 ### Phase E: Analysis (Day 15)

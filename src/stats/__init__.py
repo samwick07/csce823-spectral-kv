@@ -10,3 +10,5 @@ __all__ = [
     "EXPERIMENT_MATRIX",
     "get_config_by_id",
 ]
+
+from . import point_estimates  # noqa: F401  # N=1 point-estimate table

@@ -320,8 +320,22 @@ def eval_config_seed(
 # Analysis
 # ---------------------------------------------------------------------------
 
-def run_analysis() -> bool:
-    """Run aggregation and statistical analysis."""
+def run_analysis(seeds: list[int] | None = None) -> bool:
+    """Run the analysis phase.
+
+    With a single seed, produces the N=1 point-estimate table (no
+    significance tests). With 2+ seeds, runs the full 7-step statistical
+    pipeline (aggregate + analyze).
+    """
+    if seeds is not None and len(seeds) == 1:
+        logger.info("Single-seed run: generating N=1 point-estimate table...")
+        cmd = [sys.executable, "-m", "src.stats.point_estimates"]
+        if not run_subprocess(cmd):
+            logger.error("Point-estimate analysis failed.")
+            return False
+        logger.info("Analysis complete (point estimates).")
+        return True
+
     logger.info("Running aggregation and statistical analysis...")
 
     # Aggregate
@@ -563,7 +577,7 @@ def run_full_sweep(
         logger.info(f"  STATISTICAL ANALYSIS")
         logger.info(f"{'='*60}")
 
-        success = run_analysis()
+        success = run_analysis(seeds)
         if success:
             state["completed_analysis"] = True
             save_state(state)
@@ -636,6 +650,11 @@ def main():
         help="Single seed (eval only). Overrides --pilot.",
     )
     parser.add_argument(
+        "--seeds", type=str, default=None,
+        help="Comma-separated seed list (e.g. '0' for point-estimate runs, "
+             "'0,1,2'). Overrides --pilot and ALL_SEEDS.",
+    )
+    parser.add_argument(
         "--hf-token", type=str, default=None,
         help="HuggingFace token (or set HF_TOKEN env var)",
     )
@@ -687,6 +706,12 @@ def main():
     else:
         config_ids = ALL_CONFIG_IDS
         seeds = ALL_SEEDS
+
+    # --seeds overrides the seed list (e.g. '0' for N=1 point estimates)
+    if args.seeds is not None:
+        seeds = [int(s) for s in args.seeds.split(",") if s.strip() != ""]
+        if not seeds:
+            parser.error("--seeds parsed to an empty list")
 
     # If --seed is given, only eval that seed
     if args.seed is not None and args.phase == "eval":

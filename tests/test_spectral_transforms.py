@@ -42,6 +42,15 @@ def medium_tensor():
     return torch.randn(1, 8, 256, 128, dtype=torch.float64)
 
 
+@pytest.fixture
+def kv_tensors():
+    """KV tensors: [batch=1, num_kv_heads=8, seq_len=128, head_dim=128]."""
+    torch.manual_seed(42)
+    k = torch.randn(1, 8, 128, 128, dtype=torch.float64)
+    v = torch.randn(1, 8, 128, 128, dtype=torch.float64)
+    return k, v
+
+
 # ---------------------------------------------------------------------------
 # 1. DCT round-trip reconstruction
 # ---------------------------------------------------------------------------
@@ -364,14 +373,6 @@ class TestFixedLowPassFilter:
 
 class TestSpectralKVCache:
 
-    @pytest.fixture
-    def kv_tensors(self):
-        """KV tensors: [batch=1, num_kv_heads=8, seq_len=128, head_dim=128]."""
-        torch.manual_seed(42)
-        k = torch.randn(1, 8, 128, 128, dtype=torch.float64)
-        v = torch.randn(1, 8, 128, 128, dtype=torch.float64)
-        return k, v
-
     def test_compress_reconstruct_shape(self, kv_tensors):
         """compress -> reconstruct should return tensors with correct shape."""
         from src.spectral.cache import CompressionConfig, SpectralKVCache
@@ -560,8 +561,13 @@ class TestARTAnova:
                         transform_effect = -0.5 if t == "fft" else 0.0
                         # Learnable slightly better than fixed
                         filter_effect = -0.3 if f == "learnable" else 0.0
-                        # Gamma effect: lower gamma = higher PPL
-                        gamma_effect = {0.50: 0.5, 0.22: 2.0, 0.01: 8.0}[g]
+                        # Gamma effect: lower gamma = higher PPL.
+                        # Kept modest on purpose: _art_anova's primary
+                        # analysis pools across gamma (per its docstring),
+                        # so a huge gamma spread would inflate the error
+                        # term and mask main effects. The per-gamma
+                        # breakdown is tested via results["per_gamma"].
+                        gamma_effect = {0.50: 0.05, 0.22: 0.20, 0.01: 0.80}[g]
 
                         # Interaction: learnable+FFT synergistic
                         interaction = 0.0

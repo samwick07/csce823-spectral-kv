@@ -101,14 +101,14 @@ if raw_dir.exists():
 print(f'  Current task:    {current}')
 print(f'  Last update:     {last_update}')
 print(f'  Crash count:     {crashes}')
-print(f'  Training done:   {len(trained_on_disk)}/14 configs')
+print(f'  Training done:   {len(trained_on_disk)}/13 configs')
 if trained_on_disk:
     print(f'    {\" \".join(trained_on_disk)}')
-print(f'  Evals done:      {eval_count}/420')
+print(f'  Evals done:      {eval_count}/390')
 print(f'  Analysis done:   {\"yes\" if analysis else \"no\"}')
 
 # Progress bar
-total_evals = 420
+total_evals = 390  # 13 configs x 30 seeds (see src/stats/experiment_matrix.py)
 pct = (eval_count / total_evals * 100) if total_evals > 0 else 0
 bar_len = 40
 filled = int(bar_len * eval_count / total_evals) if total_evals > 0 else 0

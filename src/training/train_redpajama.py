@@ -13,6 +13,7 @@ Following FreqKV protocol:
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -71,7 +72,7 @@ def train_redpajama(
         token=hf_token,
         torch_dtype=torch.bfloat16,
         attn_implementation="eager",
-        device_map="auto",
+        device_map=None,  # DeepSpeed launcher owns device placement
     )
 
     # 3. Apply spectral compression BEFORE LoRA
@@ -134,12 +135,22 @@ def train_redpajama(
     )
 
     # 7. Training arguments
+    # Gradient accumulation must match the DeepSpeed config's
+    # train_batch_size: global = per_gpu x num_gpus x accumulation.
+    # (4-GPU config uses accumulation=2 to preserve the 8-GPU global batch of 64.)
+    try:
+        _ds = json.loads(Path(config.deepspeed_config).read_text())
+        grad_accum = int(_ds.get("gradient_accumulation_steps", 1))
+    except (OSError, ValueError) as e:
+        logger.warning(f"Could not read DeepSpeed config for accumulation: {e}; assuming 1")
+        grad_accum = 1
+
     training_args = TrainingArguments(
         output_dir=f"{output_dir}/{config.config_id}/phase1_redpajama",
         num_train_epochs=1,
         max_steps=config.redpajama_steps,
         per_device_train_batch_size=config.batch_size_per_gpu,
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=grad_accum,
         learning_rate=config.learning_rate,
         warmup_steps=config.warmup_steps,
         weight_decay=config.weight_decay,

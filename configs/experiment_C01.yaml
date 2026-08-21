@@ -9,7 +9,7 @@ longalpaca_context_length: 16384
 learning_rate: 1.0e-05
 warmup_steps: 100
 weight_decay: 0.01
-num_seeds: 30
+num_seeds: 1
 pg19_samples: 100
 proof_pile_samples: 100
 eval_window_size: 256

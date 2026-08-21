@@ -1,4 +1,4 @@
-"""Experiment matrix: all 14 configurations (4 variants x 3 ratios + baseline).
+"""Experiment matrix: 13 configurations (4 variants x 3 ratios + 1 baseline).
 
 The 2x2 factorial design:
   Factor A: Transform type    {DCT, Complex FFT}

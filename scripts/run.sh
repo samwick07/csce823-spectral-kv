@@ -10,7 +10,7 @@
 #     from the last checkpoint after crashes or power outages.
 #
 # Usage:
-#   bash scripts/run.sh                  # full experiment (14 configs x 30 seeds)
+#   bash scripts/run.sh                  # full experiment (13 configs x 30 seeds)
 #   bash scripts/run.sh --pilot          # pilot (3 configs x 5 seeds)
 #   bash scripts/run.sh --phase train    # training only
 #   bash scripts/run.sh --phase eval     # eval only

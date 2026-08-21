@@ -94,8 +94,11 @@ bash scripts/setup_env.sh
 # Pilot run first (3 configs x 5 seeds, ~22 hours)
 bash scripts/run.sh --pilot
 
-# Full experiment (14 configs x 30 seeds, ~14 days)
+# Full experiment (13 configs x 30 seeds, ~13 days)
 bash scripts/run.sh
+
+# N=1 point-estimate run (class-project protocol, ~7 days)
+bash scripts/run.sh --seeds 0
 ```
 
 That's it. `run.sh` launches the orchestrator inside a tmux session that
@@ -104,8 +107,8 @@ automatically:
 
 | Phase | Description | Hardware | Duration |
 |-------|-------------|----------|----------|
-| 1. Train | 14 configs via DeepSpeed ZeRO-2 | 4x H200 | ~6.5 days |
-| 2. Eval | 420 runs, 4-way parallel (1 GPU each) | 4x H200 | ~7.5 days |
+| 1. Train | 13 configs via DeepSpeed ZeRO-2 | 4x H200 | ~5-6.5 days |
+| 2. Eval | 390 runs, 4-way parallel (1 GPU each) | 4x H200 | ~7 days |
 | 3. Analyze | 7-step statistical pipeline (ART ANOVA) | CPU | seconds |
 | 4. Exfil | Package + upload to HuggingFace Hub | CPU | minutes |
 
@@ -209,8 +212,9 @@ bash scripts/smoke_test.sh
   Removed `flash-attn` from requirements; using `attn_implementation="eager"`.
 
 - **4-GPU DeepSpeed configs**: `deepspeed_zero2_4gpu.json` and
-  `deepspeed_zero2_4gpu_longctx.json` with `train_batch_size=32`
-  (8 micro-batch per GPU x 4 GPUs).
+  `deepspeed_zero2_4gpu_longctx.json` with `train_batch_size=64`
+  (8 micro-batch per GPU x 4 GPUs x 2 gradient accumulation),
+  preserving the FreqKV-protocol global batch of 64.
 
 - **Centralized model identifiers**: All model name references go through
   `src/utils/constants.py` (`DEFAULT_MODEL_NAME`,
@@ -221,6 +225,16 @@ bash scripts/smoke_test.sh
   used instead of per-factor Kruskal-Wallis because it correctly detects
   interaction effects — the core research question of whether the benefit
   of learnable filtering depends on transform type.
+
+## Repository Split
+
+This repository (N=1, class-project protocol) is the point-estimate version of
+the experiment: 13 configs, 1 seed, `results/point/point_table.md` is the
+deliverable. The full N=30 publication experiment -- 30 seeds per config,
+bootstrap distributions, and the 7-step significance pipeline -- is archived
+unchanged at [samwick07/spectral-kv](https://github.com/samwick07/spectral-kv)
+(tag `n30-v1.0`) and runs with the same entry points (`--seeds` defaults to
+the full 0-29 list there).
 
 ## Author
 
