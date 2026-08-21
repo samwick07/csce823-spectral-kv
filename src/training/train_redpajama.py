@@ -95,7 +95,16 @@ def train_redpajama(
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
-    # 5. Load and tokenize RedPajama
+    # 5. Initialize W&B for this phase (deterministic ID for crash recovery)
+    try:
+        from ..utils.wandb_utils import init_wandb, finish_wandb
+        init_wandb(config, phase="phase1_redpajama")
+        use_wandb = True
+    except Exception as e:
+        logger.warning(f"W&B init failed: {e}. Continuing without W&B.")
+        use_wandb = False
+
+    # 6. Load and tokenize RedPajama
     logger.info("Loading RedPajama dataset")
     dataset = load_dataset(
         "togethercomputer/RedPajama-Data-1T-Sample",
@@ -124,7 +133,7 @@ def train_redpajama(
         mlm=False,
     )
 
-    # 6. Training arguments
+    # 7. Training arguments
     training_args = TrainingArguments(
         output_dir=f"{output_dir}/{config.config_id}/phase1_redpajama",
         num_train_epochs=1,
@@ -146,7 +155,7 @@ def train_redpajama(
         remove_unused_columns=False,
     )
 
-    # 7. Train (with automatic resume from latest checkpoint)
+    # 8. Train (with automatic resume from latest checkpoint)
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -174,5 +183,12 @@ def train_redpajama(
     # Write completion marker for orchestrator
     (ckpt_dir / ".training_complete").touch()
     logger.info(f"Phase 1 checkpoint saved to {ckpt_dir}")
+
+    # Finish W&B run for this phase
+    if use_wandb:
+        try:
+            finish_wandb({"final_checkpoint": str(ckpt_dir)})
+        except Exception as e:
+            logger.warning(f"W&B finish failed: {e}")
 
     return str(ckpt_dir)

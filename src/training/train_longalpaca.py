@@ -91,7 +91,16 @@ def train_longalpaca(
     model = PeftModel.from_pretrained(model, phase1_checkpoint)
     logger.info(f"Loaded Phase 1 LoRA adapters from {phase1_checkpoint}")
 
-    # 5. Load and tokenize LongAlpaca-16k
+    # 5. Initialize W&B for this phase (deterministic ID for crash recovery)
+    try:
+        from ..utils.wandb_utils import init_wandb, finish_wandb
+        init_wandb(config, phase="phase2_longalpaca")
+        use_wandb = True
+    except Exception as e:
+        logger.warning(f"W&B init failed: {e}. Continuing without W&B.")
+        use_wandb = False
+
+    # 6. Load and tokenize LongAlpaca-16k
     logger.info("Loading LongAlpaca-16k dataset")
     dataset = load_dataset("Yukang/LongAlpaca-16k", split="train")
 
@@ -124,7 +133,7 @@ def train_longalpaca(
         mlm=False,
     )
 
-    # 6. Training arguments
+    # 7. Training arguments
     training_args = TrainingArguments(
         output_dir=f"{output_dir}/{config.config_id}/phase2_longalpaca",
         num_train_epochs=config.longalpaca_epochs,
@@ -144,7 +153,7 @@ def train_longalpaca(
         remove_unused_columns=False,
     )
 
-    # 7. Train (with automatic resume from latest checkpoint)
+    # 8. Train (with automatic resume from latest checkpoint)
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -172,5 +181,12 @@ def train_longalpaca(
     # Write completion marker for orchestrator
     (ckpt_dir / ".training_complete").touch()
     logger.info(f"Phase 2 checkpoint saved to {ckpt_dir}")
+
+    # Finish W&B run for this phase
+    if use_wandb:
+        try:
+            finish_wandb({"final_checkpoint": str(ckpt_dir)})
+        except Exception as e:
+            logger.warning(f"W&B finish failed: {e}")
 
     return str(ckpt_dir)

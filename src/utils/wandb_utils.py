@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +30,23 @@ def init_wandb(
     project: str = WANDB_PROJECT,
     tags: list[str] | None = None,
     notes: str = "",
+    resume: Literal["allow", "never", "must", "auto"] = "allow",
 ) -> Any:
     """Initialize a W&B run with full experiment configuration.
 
     Logs all experiment parameters as W&B config for reproducibility.
     The run is tagged with the variant name, compression ratio, and phase
     for easy filtering in the W&B dashboard.
+
+    Uses a deterministic run ID so that crashes don't fragment a single
+    training run into multiple W&B runs. On restart, wandb.init with
+    resume="allow" will resume the existing run and append new logs.
+
+    The step overlap that occurs when DeepSpeed resumes from a checkpoint
+    (re-logging a step that was already logged before the crash) is
+    handled correctly by W&B: the existing value at that step is
+    overwritten with an identical value (model state was restored from
+    the checkpoint, so the metrics are the same).
 
     Args:
         config: ExperimentConfig dataclass with all experiment settings.
@@ -44,6 +55,9 @@ def init_wandb(
         project: W&B project name.
         tags: Additional tags for the run.
         notes: Free-text notes for the run.
+        resume: W&B resume mode. "allow" (default) resumes if the run id
+            already exists, otherwise creates a new run. "must" requires
+            the run to already exist. "never" always creates a new run.
 
     Returns:
         The wandb.Run object.
@@ -69,7 +83,15 @@ def init_wandb(
     if tags:
         default_tags.extend(tags)
 
+    # Deterministic run ID: ensures crash recovery resumes the same W&B run
+    # instead of creating a new one. Format: {config_id}_{phase}
+    # This also gives each phase its own run, preventing step overlap
+    # between Phase 1 (steps 10-1000) and Phase 2 (steps 10-50).
+    run_id = f"{config.config_id}_{phase}"
+
     run = wandb.init(
+        id=run_id,
+        resume=resume,
         project=project,
         entity=entity,
         name=f"{config.config_id}_{phase}",
@@ -80,7 +102,7 @@ def init_wandb(
     )
 
     logger.info(
-        f"Initialized W&B run: {run.name} "
+        f"Initialized W&B run: {run.name} (id={run_id}, resume={resume}) "
         f"(project={project}, entity={entity or 'default'})"
     )
 

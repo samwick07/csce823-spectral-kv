@@ -42,6 +42,10 @@ def run_training(
 ) -> str:
     """Run both training phases for an experiment.
 
+    Each phase initializes its own W&B run with a deterministic ID
+    (e.g., "C01_phase1_redpajama") so that crash recovery resumes
+    the same run instead of creating a duplicate.
+
     Args:
         config: ExperimentConfig.
         hf_token: HuggingFace token.
@@ -49,38 +53,17 @@ def run_training(
     Returns:
         Path to the final Phase 2 checkpoint.
     """
-    # Initialize W&B for training
-    try:
-        from .utils.wandb_utils import init_wandb, log_spectral_stats, finish_wandb
-        wandb_run = init_wandb(config, phase="train")
-        use_wandb = True
-    except Exception as e:
-        logger.warning(f"W&B init failed: {e}. Continuing without W&B.")
-        use_wandb = False
-
     # Phase 1: RedPajama CPT
     logger.info("=" * 60)
     logger.info("PHASE 1: RedPajama Continued Pre-Training")
     logger.info("=" * 60)
     phase1_ckpt = train_redpajama(config, hf_token=hf_token)
 
-    # Log spectral stats after Phase 1
-    if use_wandb:
-        try:
-            # Re-apply compression to log filter masks
-            # (The model inside the trainer has been saved; we log from checkpoint)
-            log_spectral_stats.__wrapped__ if hasattr(log_spectral_stats, "__wrapped__") else None
-        except Exception:
-            pass
-
     # Phase 2: LongAlpaca SFT
     logger.info("=" * 60)
     logger.info("PHASE 2: LongAlpaca Supervised Fine-Tuning")
     logger.info("=" * 60)
     phase2_ckpt = train_longalpaca(config, phase1_ckpt, hf_token=hf_token)
-
-    if use_wandb:
-        finish_wandb({"final_checkpoint": phase2_ckpt})
 
     return phase2_ckpt
 
