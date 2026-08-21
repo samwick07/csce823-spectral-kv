@@ -98,17 +98,26 @@ if raw_dir.exists():
             if (seed_dir / 'all_results.json').exists():
                 eval_count += 1
 
+# Total evals from the config (13 configs x num_seeds) so the monitor
+# is correct for both the N=1 (class) and N=30 (archive) repos.
+try:
+    import yaml
+    with open('configs/experiment_C00.yaml') as f:
+        _num_seeds = max(1, int((yaml.safe_load(f) or {}).get('num_seeds', 30)))
+except Exception:
+    _num_seeds = 30
+total_evals = 13 * _num_seeds
+
 print(f'  Current task:    {current}')
 print(f'  Last update:     {last_update}')
 print(f'  Crash count:     {crashes}')
 print(f'  Training done:   {len(trained_on_disk)}/13 configs')
 if trained_on_disk:
     print(f'    {\" \".join(trained_on_disk)}')
-print(f'  Evals done:      {eval_count}/390')
+print(f'  Evals done:      {eval_count}/{total_evals}')
 print(f'  Analysis done:   {\"yes\" if analysis else \"no\"}')
 
 # Progress bar
-total_evals = 390  # 13 configs x 30 seeds (see src/stats/experiment_matrix.py)
 pct = (eval_count / total_evals * 100) if total_evals > 0 else 0
 bar_len = 40
 filled = int(bar_len * eval_count / total_evals) if total_evals > 0 else 0

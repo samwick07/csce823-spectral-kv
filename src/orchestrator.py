@@ -56,8 +56,28 @@ LOG_DIR = PROJECT_ROOT / "logs"
 
 ALL_CONFIG_IDS = [f"C{i:02d}" for i in range(13)]
 PILOT_CONFIG_IDS = ["C00", "C07", "C10"]
-ALL_SEEDS = list(range(30))
 PILOT_SEEDS = list(range(5))
+
+
+def _default_num_seeds() -> int:
+    """Full-run seed count from the config YAML (single source of truth).
+
+    The class-project repo uses num_seeds=1 (point estimates); the
+    publication archive uses num_seeds=30. This lets the same orchestrator
+    drive both without a fork.
+    """
+    try:
+        import yaml
+
+        with open(CONFIGS_DIR / "experiment_C00.yaml") as f:
+            data = yaml.safe_load(f) or {}
+        return max(1, int(data.get("num_seeds", 30)))
+    except (OSError, ValueError, ImportError) as e:
+        logger.warning(f"Could not read num_seeds from config (defaulting to 30): {e}")
+        return 30
+
+
+ALL_SEEDS = list(range(_default_num_seeds()))
 
 # Graceful shutdown: set to True by signal handler
 _shutdown_requested = False
