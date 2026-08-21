@@ -97,23 +97,26 @@ can use the stock Llama-3.1-8B-Instruct checkpoint, saving ~12 hours.
 | Efficiency  | 1       | 128 token gen       | ~2 min            |
 | **Total per seed** | |                     | **~1.7 hours**    |
 
-### Full Evaluation Matrix
+### Full Evaluation Matrix (N=1)
 
 | Item                         | Value              |
 |-----------------------------|--------------------|
 | Configurations              | 13                 |
-| Seeds per config            | 30                 |
-| Total eval runs             | 390                |
+| Seeds per config            | 1                  |
+| Total eval runs             | 13                 |
 | Time per eval run (1 GPU)   | ~1.7 hours         |
-| **Total GPU-hours (eval)**  | **~663 GPU-hours** |
+| **Total GPU-hours (eval)**  | **~22 GPU-hours**  |
+
+> The N=30 publication protocol (390 eval runs, ~663 GPU-hours) is documented
+> in the [spectral-kv archive](https://github.com/samwick07/spectral-kv).
 
 ### Parallelization Across 4 GPUs
 
 | Strategy                    | Wall Clock         |
 |-----------------------------|--------------------|
-| 1 GPU (sequential)          | ~663 hours (~27.6 days) |
-| 2 GPUs                      | ~332 hours (~13.8 days) |
-| **4 GPUs (recommended)**    | **~166 hours (~6.9 days)** |
+| 1 GPU (sequential)          | ~22 hours          |
+| 2 GPUs                      | ~11 hours          |
+| **4 GPUs (recommended)**    | **~6 hours**       |
 
 With 4 GPUs, distribute 13 configs across GPUs:
 - GPU 0: C00 (baseline, fast) + C01 + C02 + C03
@@ -121,16 +124,19 @@ With 4 GPUs, distribute 13 configs across GPUs:
 - GPU 2: C07 + C08 + C09
 - GPU 3: C10 + C11 + C12
 
+> N=30 publication protocol (390 eval runs, ~166 hours / ~6.9 days on 4 GPUs)
+> is documented in the [spectral-kv archive](https://github.com/samwick07/spectral-kv).
+
 ---
 
-## 5. Total Compute Budget Summary
+## 5. Total Compute Budget Summary (N=1)
 
 | Phase         | GPU-Hours   | Wall Clock (4 GPU)    |
 |--------------|-------------|----------------------|
 | Training     | ~480-600    | ~4.8-6.5 days        |
-| Evaluation   | ~663        | ~6.9 days            |
-| Analysis     | ~2          | ~10 min              |
-| **Total**    | **~1,145-1,265** | **~11.7-13.4 days** |
+| Evaluation   | ~22         | ~0.3 days            |
+| Analysis     | ~0          | seconds              |
+| **Total**    | **~480-622** | **~5.1-6.8 days**   |
 
 ### Pilot Run (Recommended First)
 
@@ -147,7 +153,7 @@ Before the full sweep, run a pilot with 3 configs × 5 seeds:
 | **Pilot wall clock**   | **~8 hours**   |
 
 This validates the pipeline end-to-end and catches bugs before committing
-to the full 1,200+ GPU-hour run.
+to the full ~500 GPU-hour class-project run.
 
 ---
 
@@ -203,24 +209,24 @@ Network is not a bottleneck thanks to NVLink 4.0 and CCR's high-speed internet.
 2. Verify aggregation and statistical analysis pipeline
 3. Estimated time: ~22 hours
 
-### Phase C: Full Training (Days 2-7)
+### Phase C: Full Training (Days 2-6)
 1. `bash scripts/run.sh --phase train` — trains all 13 configurations sequentially
 2. ~9-12 hours per config, ~117-156 hours total
 3. Monitor via `bash scripts/monitor.sh --watch` or W&B dashboard
 
-### Phase D: Full Evaluation (Days 8-15)
+### Phase D: Full Evaluation (Day 6)
 1. `bash scripts/run.sh --phase eval` — evaluates 13 configs across 4 GPUs
-2. 30 seeds per config, ~1.7 hours per seed
-3. ~166 hours wall clock
+2. 1 seed per config, ~1.7 hours per run
+3. ~4 hours wall clock (13 runs, 4-way parallel)
 4. Monitor via `bash scripts/monitor.sh --watch`
 
-### Phase E: Analysis (Day 15)
+### Phase E: Analysis (Day 7)
 1. `bash scripts/run.sh --phase analyze`
-2. Aggregates results: `python -m src.stats.aggregate`
-3. Runs 7-step statistical analysis: `python -m src.stats.analyze`
-4. Generates figures and tables
+2. Single-seed run -> point-estimate table:
+   `python -m src.stats.point_estimates` -> `results/point/point_table.{csv,md}`
+3. (2+ seeds -> 7-step pipeline: aggregate + analyze, as in the archive)
 
-**Total elapsed time: ~15 days** (with pilot, training, eval, analysis)
+**Total elapsed time: ~7 days** (with pilot, training, eval, analysis)
 
 Note: The orchestrator auto-resumes after crashes. If the workspace
 loses power, simply re-run `bash scripts/run.sh` and it will skip
@@ -235,7 +241,8 @@ If only 2 H200s are available (instead of 4):
 | Phase         | 2× H200 Wall Clock | 4× H200 Wall Clock |
 |--------------|--------------------|--------------------|
 | Training     | ~9.6-13 days       | ~4.8-6.5 days      |
-| Evaluation   | ~15 days           | ~7.5 days          |
-| **Total**    | **~25 days**       | **~14 days**       |
+| Evaluation   | ~2 days            | ~0.3 days          |
+| **Total**    | **~12-15 days**    | **~5.1-6.8 days**  |
 
 The project is feasible on 2× H200 but takes roughly 2× longer.
+(N=30 archive protocol: ~25 days on 2× H200 / ~14 days on 4× H200.)

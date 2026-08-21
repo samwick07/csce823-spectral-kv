@@ -91,14 +91,14 @@ bash scripts/setup_env.sh
 ### Running the Experiment
 
 ```bash
-# Pilot run first (3 configs x 5 seeds, ~22 hours)
+# Pilot run first (3 configs x 5 seeds, ~22 hours) -- pipeline validation
 bash scripts/run.sh --pilot
 
-# Full experiment (13 configs x 30 seeds, ~13 days)
+# Class-project run: 13 configs x 1 seed (num_seeds=1 in the YAMLs), ~7 days
 bash scripts/run.sh
 
-# N=1 point-estimate run (class-project protocol, ~7 days)
-bash scripts/run.sh --seeds 0
+# Override the seed list for a partial or ad-hoc run
+bash scripts/run.sh --seeds 0,1
 ```
 
 That's it. `run.sh` launches the orchestrator inside a tmux session that
@@ -108,9 +108,15 @@ automatically:
 | Phase | Description | Hardware | Duration |
 |-------|-------------|----------|----------|
 | 1. Train | 13 configs via DeepSpeed ZeRO-2 | 4x H200 | ~5-6.5 days |
-| 2. Eval | 390 runs, 4-way parallel (1 GPU each) | 4x H200 | ~7 days |
-| 3. Analyze | 7-step statistical pipeline (ART ANOVA) | CPU | seconds |
+| 2. Eval | 13 runs (13 x 1 seed), 4-way parallel (1 GPU each) | 4x H200 | ~1.5 days |
+| 3. Analyze | Point-estimate table (single seed -- no significance tests) | CPU | seconds |
 | 4. Exfil | Package + upload to HuggingFace Hub | CPU | minutes |
+
+The seed count comes from `num_seeds` in the config YAMLs (1 here). With a
+single seed the analysis phase produces `results/point/point_table.md`
+via `src/stats/point_estimates.py` instead of the 7-step pipeline; pass
+2+ seeds via `--seeds` to get the full statistical analysis. The N=30
+publication protocol lives in the archive repository (see below).
 
 ### Monitoring
 
