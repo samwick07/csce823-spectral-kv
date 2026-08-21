@@ -1,9 +1,12 @@
 # Results and checkpoints
 results/
+checkpoints/
+logs/
 *.bin
 *.safetensors
 *.pt
 *.ckpt
+.orchestrator_pid
 
 # Python
 __pycache__/

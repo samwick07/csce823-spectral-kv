@@ -146,7 +146,7 @@ def train_redpajama(
         remove_unused_columns=False,
     )
 
-    # 7. Train
+    # 7. Train (with automatic resume from latest checkpoint)
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -154,13 +154,25 @@ def train_redpajama(
         data_collator=data_collator,
     )
 
+    # Auto-resume: check for existing checkpoints in the output_dir
+    resume_ckpt = None
+    ckpt_base = Path(training_args.output_dir)
+    if ckpt_base.exists():
+        checkpoints = sorted(ckpt_base.glob("checkpoint-*"))
+        if checkpoints:
+            resume_ckpt = str(checkpoints[-1])
+            logger.info(f"Resuming Phase 1 from {resume_ckpt}")
+
     logger.info("Starting Phase 1 training")
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_ckpt)
 
     # 8. Save checkpoint
     ckpt_dir = Path(output_dir) / config.config_id / "phase1_redpajama" / "final"
     trainer.save_model(str(ckpt_dir))
     tokenizer.save_pretrained(str(ckpt_dir))
+
+    # Write completion marker for orchestrator
+    (ckpt_dir / ".training_complete").touch()
     logger.info(f"Phase 1 checkpoint saved to {ckpt_dir}")
 
     return str(ckpt_dir)

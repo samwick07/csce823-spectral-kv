@@ -15,9 +15,9 @@ proof_pile_samples: 100
 eval_window_size: 256
 eval_temperature: 0.7
 eval_top_p: 0.9
-num_gpus: 8
+num_gpus: 4
 batch_size_per_gpu: 8
-deepspeed_config: configs/deepspeed_zero2_8gpu.json
+deepspeed_config: configs/deepspeed_zero2_4gpu.json
 output_dir: results
 wandb_project: csce823-spectral-kv
 max_seq_len: 16384

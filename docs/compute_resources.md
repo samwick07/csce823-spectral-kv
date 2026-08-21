@@ -11,12 +11,12 @@
 | Specification               | Value                          |
 |-----------------------------|--------------------------------|
 | GPU                         | NVIDIA H200 (SXM5)            |
-| GPUs available              | 8                              |
+| GPUs available              | 4                              |
 | HBM3e memory per GPU        | 141 GB                         |
-| Aggregate HBM               | 1,128 GB (1.1 TB)             |
+| Aggregate HBM               | 564 GB                         |
 | Memory bandwidth per GPU    | 4.8 TB/s                       |
 | FP16/BF16 compute per GPU   | 1,979 TFLOPS                  |
-| Aggregate FP16/BF16         | 15,832 TFLOPS (~15.8 PFLOPS)  |
+| Aggregate FP16/BF16         | 7,916 TFLOPS (~7.9 PFLOPS)   |
 | Interconnect                | NVLink 4.0 (900 GB/s)         |
 
 ---
@@ -47,16 +47,13 @@
 | **Total per GPU**         | **~82 GB**    |
 | **Headroom**              | **~59 GB**    |
 
-### Conclusion: 8× H200 is Overkill for Training (Intentionally)
+### Conclusion: 4× H200 is Sufficient for Training
 
-Training Llama-3.1-8B with LoRA r=8 is comfortable on 4× H200. With 8× H200, you have
-two options:
+Training Llama-3.1-8B with LoRA r=8 is comfortable on 4× H200. With 4× H200, the
+model trains with large headroom for batch size tuning.
 
-1. **Use all 8 GPUs for training** — faster throughput, larger effective batch
-2. **Use 4 GPUs for training, 4 for parallel evaluation** — maximizes pipeline throughput
-
-Recommendation: Use all 8 for training (ZeRO-2 across 8 GPUs gives ~55 GB/GPU with
-large headroom for batch size tuning). Then switch to parallel eval mode using all 8
+Recommendation: Use all 4 for training (ZeRO-2 across 4 GPUs gives ~65 GB/GPU with
+large headroom). Then switch to parallel eval mode using all 4
 GPUs independently (1 config per GPU, seeds run sequentially within each).
 
 ---
@@ -65,26 +62,26 @@ GPUs independently (1 config per GPU, seeds run sequentially within each).
 
 ### Per-Configuration Training
 
-| Phase             | Dataset         | Steps/Epochs     | Batch Size | Est. Time (8 GPU) |
+| Phase             | Dataset         | Steps/Epochs     | Batch Size | Est. Time (4 GPU) |
 |-------------------|-----------------|------------------|------------|-------------------|
-| Phase 1: CPT      | RedPajama       | 1,000 steps      | 64         | ~1.5-2 hours      |
-| Phase 2: SFT      | LongAlpaca-16k  | 5 epochs         | 64         | ~3-4 hours        |
-| **Total per config** |              |                  |            | **~5-6 hours**    |
+| Phase 1: CPT      | RedPajama       | 1,000 steps      | 32         | ~3-4 hours        |
+| Phase 2: SFT      | LongAlpaca-16k  | 5 epochs         | 32         | ~6-8 hours        |
+| **Total per config** |              |                  |            | **~9-12 hours**   |
 
 ### All 14 Configurations
 
 | Item                    | Value          |
 |------------------------|----------------|
 | Configurations         | 14 (13 + baseline) |
-| Training time per config | ~5-6 hours   |
-| Sequential training    | ~70-84 hours   |
-| **Wall clock (sequential)** | **~3-3.5 days** |
+| Training time per config | ~9-12 hours   |
+| Sequential training    | ~126-168 hours |
+| **Wall clock (sequential)** | **~5.3-7 days** |
 
-Training must be sequential (each config uses all 8 GPUs via DeepSpeed).
+Training must be sequential (each config uses all 4 GPUs via DeepSpeed).
 However, the baseline (C00) doesn't need spectral compression training — it
-can use the stock Llama-3.1-8B-Instruct checkpoint, saving ~6 hours.
+can use the stock Llama-3.1-8B-Instruct checkpoint, saving ~12 hours.
 
-**Adjusted training estimate: ~64-78 hours (~2.7-3.3 days)**
+**Adjusted training estimate: ~114-156 hours (~4.8-6.5 days)**
 
 ---
 
@@ -110,34 +107,30 @@ can use the stock Llama-3.1-8B-Instruct checkpoint, saving ~6 hours.
 | Time per eval run (1 GPU)   | ~1.7 hours         |
 | **Total GPU-hours (eval)**  | **~714 GPU-hours** |
 
-### Parallelization Across 8 GPUs
+### Parallelization Across 4 GPUs
 
 | Strategy                    | Wall Clock         |
 |-----------------------------|--------------------|
 | 1 GPU (sequential)          | ~714 hours (~30 days) |
-| 4 GPUs                      | ~179 hours (~7.5 days) |
-| **8 GPUs (recommended)**    | **~89 hours (~3.7 days)** |
+| 2 GPUs                      | ~357 hours (~15 days) |
+| **4 GPUs (recommended)**    | **~179 hours (~7.5 days)** |
 
-With 8 GPUs, distribute 14 configs across GPUs (2 per GPU, 1 GPU gets 1 config + baseline):
-- GPU 0: C00 (baseline, fast) + C01
-- GPU 1: C02 + C03
-- GPU 2: C04 + C05
-- GPU 3: C06 + C07
-- GPU 4: C08 + C09
-- GPU 5: C10 + C11
-- GPU 6: C12
-- GPU 7: Reserved (efficiency, overflow, monitoring)
+With 4 GPUs, distribute 14 configs across GPUs:
+- GPU 0: C00 (baseline, fast) + C01 + C02 + C03
+- GPU 1: C04 + C05 + C06
+- GPU 2: C07 + C08 + C09
+- GPU 3: C10 + C11 + C12
 
 ---
 
 ## 5. Total Compute Budget Summary
 
-| Phase         | GPU-Hours   | Wall Clock (8 GPU)   |
+| Phase         | GPU-Hours   | Wall Clock (4 GPU)    |
 |--------------|-------------|----------------------|
-| Training     | ~500-624    | ~2.7-3.3 days        |
-| Evaluation   | ~714        | ~3.7 days            |
+| Training     | ~500-624    | ~4.8-6.5 days        |
+| Evaluation   | ~714        | ~7.5 days            |
 | Analysis     | ~2          | ~10 min              |
-| **Total**    | **~1,216-1,340** | **~6.4-7.0 days** |
+| **Total**    | **~1,216-1,340** | **~12.3-14 days** |
 
 ### Pilot Run (Recommended First)
 
@@ -200,48 +193,49 @@ Network is not a bottleneck thanks to NVLink 4.0 and CCR's high-speed internet.
 ## 9. Recommended Execution Plan
 
 ### Phase A: Environment Setup (Day 0)
-1. Verify 8× H200 visibility: `nvidia-smi`
-2. Create venv, install requirements.txt
+1. Verify 4× H200 visibility: `nvidia-smi`
+2. `bash scripts/setup_env.sh` — creates venv, installs deps, downloads model + datasets
 3. HuggingFace login (request Llama-3.1 access if not already approved)
-4. Pre-download datasets: RedPajama, LongAlpaca-16k, PG-19, Proof-pile, LongBench
-5. Smoke test: load model, run 10-step training, run 1-sample eval
+4. Smoke test: `bash scripts/smoke_test.sh`
 
 ### Phase B: Pilot Run (Day 1)
-1. Train C00 (baseline), C07 (FFT+fixed), C10 (FFT+learnable) at gamma=0.50
-2. Evaluate with 5 seeds each
-3. Verify aggregation and statistical analysis pipeline
-4. Estimated time: ~8 hours
+1. `bash scripts/run.sh --pilot` — trains C00, C07, C10 at gamma=0.50, evals 5 seeds each
+2. Verify aggregation and statistical analysis pipeline
+3. Estimated time: ~22 hours
 
-### Phase C: Full Training (Days 2-4)
-1. Train all 14 configurations sequentially
-2. ~5-6 hours per config, ~70-84 hours total
-3. Monitor via W&B
+### Phase C: Full Training (Days 2-7)
+1. `bash scripts/run.sh --phase train` — trains all 14 configurations sequentially
+2. ~9-12 hours per config, ~114-156 hours total
+3. Monitor via `bash scripts/monitor.sh --watch` or W&B dashboard
 
-### Phase D: Full Evaluation (Days 5-8)
-1. Distribute 14 configs across 8 GPUs (2 per GPU)
+### Phase D: Full Evaluation (Days 8-15)
+1. `bash scripts/run.sh --phase eval` — evaluates 14 configs across 4 GPUs
 2. 30 seeds per config, ~1.7 hours per seed
-3. ~89 hours wall clock
-4. Monitor via results/ directory
+3. ~179 hours wall clock
+4. Monitor via `bash scripts/monitor.sh --watch`
 
-### Phase E: Analysis (Day 8)
-1. Aggregate results: `python -m src.stats.aggregate`
-2. Run 7-step statistical analysis: `python -m src.stats.analyze`
-3. Generate figures and tables
+### Phase E: Analysis (Day 15)
+1. `bash scripts/run.sh --phase analyze`
+2. Aggregates results: `python -m src.stats.aggregate`
+3. Runs 7-step statistical analysis: `python -m src.stats.analyze`
+4. Generates figures and tables
 
-**Total elapsed time: ~8 days** (with pilot, training, eval, analysis)
+**Total elapsed time: ~15 days** (with pilot, training, eval, analysis)
+
+Note: The orchestrator auto-resumes after crashes. If the workspace
+loses power, simply re-run `bash scripts/run.sh` and it will skip
+completed work and resume from the last checkpoint.
 
 ---
 
-## 10. Contingency: 4× H200
+## 10. Contingency: 2× H200
 
-If only 4 H200s are available (instead of 8):
+If only 2 H200s are available (instead of 4):
 
-| Phase         | 4× H200 Wall Clock | 8× H200 Wall Clock |
+| Phase         | 2× H200 Wall Clock | 4× H200 Wall Clock |
 |--------------|--------------------|--------------------|
-| Training     | ~5.4-6.6 days      | ~2.7-3.3 days      |
-| Evaluation   | ~7.5 days          | ~3.7 days          |
-| **Total**    | **~13 days**       | **~7 days**        |
+| Training     | ~9.6-13 days       | ~4.8-6.5 days      |
+| Evaluation   | ~15 days           | ~7.5 days          |
+| **Total**    | **~25 days**       | **~14 days**       |
 
-The project is feasible on 4× H200 but takes roughly 2× longer. The 8× H200
-configuration is recommended for the 30-seed statistical analysis to complete
-within a reasonable timeframe.
+The project is feasible on 2× H200 but takes roughly 2× longer.
