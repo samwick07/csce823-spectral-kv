@@ -137,9 +137,22 @@ def train_longalpaca(
     # 7. Training arguments
     # Gradient accumulation must match the DeepSpeed config's
     # train_batch_size: global = per_gpu x num_gpus x accumulation.
-    # (4-GPU config uses accumulation=2 to preserve the 8-GPU global batch of 64.)
+    #
+    # Phase 2 uses the longctx variant (micro_bs=2, higher accum) because
+    # LongAlpaca sequences are up to 16K tokens and need smaller micro-batches
+    # to fit in H200 memory.  The naming convention is:
+    #   deepspeed_zero2_Ngpu.json → deepspeed_zero2_Ngpu_longctx.json
+    ds_path = Path(config.deepspeed_config)
+    longctx_path = ds_path.parent / (ds_path.stem + "_longctx.json")
+    if longctx_path.exists():
+        ds_config_path = str(longctx_path)
+        logger.info(f"Phase 2: using longctx DS config: {ds_config_path}")
+    else:
+        ds_config_path = str(ds_path)
+        logger.warning(f"Phase 2: longctx DS config not found ({longctx_path}); using {ds_config_path}")
+
     try:
-        _ds = json.loads(Path(config.deepspeed_config).read_text())
+        _ds = json.loads(Path(ds_config_path).read_text())
         grad_accum = int(_ds.get("gradient_accumulation_steps", 1))
     except (OSError, ValueError) as e:
         logger.warning(f"Could not read DeepSpeed config for accumulation: {e}; assuming 1")
@@ -157,7 +170,7 @@ def train_longalpaca(
         logging_steps=10,
         save_strategy="epoch",
         save_total_limit=config.longalpaca_epochs,
-        deepspeed=config.deepspeed_config,
+        deepspeed=ds_config_path,
         report_to="wandb",
         run_name=f"{config.config_id}_phase2_longalpaca",
         gradient_checkpointing=True,

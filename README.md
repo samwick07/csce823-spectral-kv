@@ -204,7 +204,7 @@ From the downloaded data:
 ## Testing
 
 ```bash
-# Unit tests (no GPU required, 28 tests)
+# Unit tests (no GPU required, 43 tests)
 pytest tests/test_spectral_transforms.py -v
 
 # Integration smoke tests (requires GPU + network)

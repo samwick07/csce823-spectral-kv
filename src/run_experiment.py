@@ -298,6 +298,12 @@ def main():
         help="HuggingFace token for gated models",
     )
     parser.add_argument(
+        "--deepspeed-config",
+        type=str,
+        default=None,
+        help="Override the DeepSpeed config path from the YAML (auto-selected by orchestrator)",
+    )
+    parser.add_argument(
         "--log-file",
         type=str,
         default=None,
@@ -308,6 +314,11 @@ def main():
 
     # Load config
     config = load_config(args.config)
+
+    # Override DeepSpeed config if provided (orchestrator auto-selects based on GPU count)
+    if args.deepspeed_config:
+        config.deepspeed_config = args.deepspeed_config
+        logger.info(f"Overrode DeepSpeed config: {config.deepspeed_config}")
 
     # Set up logging
     setup_logging(

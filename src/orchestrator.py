@@ -259,6 +259,12 @@ def train_config(config_id: str, hf_token: str | None) -> bool:
     # Determine how many GPUs to use
     num_gpus = _detect_gpu_count()
 
+    # Auto-select the DeepSpeed config matching the actual GPU count.
+    # The YAML defaults to the 4-GPU config; if we detect 8 GPUs we must
+    # switch to the 8-GPU config (accum=1, micro_bs=8) to keep
+    # train_batch_size consistent (global = micro_bs x num_gpus x accum = 64).
+    ds_config = _select_deepspeed_config(config_file, num_gpus)
+
     # Build the training command
     cmd = [
         sys.executable, "-m", "deepspeed",
@@ -266,11 +272,12 @@ def train_config(config_id: str, hf_token: str | None) -> bool:
         "src/run_experiment.py",
         "--config", str(config_file),
         "--mode", "train",
+        "--deepspeed-config", ds_config,
     ]
     if hf_token:
         cmd.extend(["--hf-token", hf_token])
 
-    logger.info(f"[{config_id}] Starting training on {num_gpus} GPUs")
+    logger.info(f"[{config_id}] Starting training on {num_gpus} GPUs (DS: {ds_config})")
     success = run_subprocess(cmd)
 
     if success and is_training_complete(config_id):
@@ -401,6 +408,66 @@ def _detect_gpu_count() -> int:
         pass
     logger.warning("Could not detect GPU count, defaulting to 4.")
     return 4
+
+
+def _select_deepspeed_config(config_file: Path, num_gpus: int) -> str:
+    """Auto-select the DeepSpeed config matching the actual GPU count.
+
+    The YAML defaults to the 4-GPU config.  If we detect a different GPU
+    count we switch to the matching config so that
+    train_batch_size = micro_bs x num_gpus x accum remains 64.
+
+    Phase 1 (RedPajama) always uses the standard config.
+    Phase 2 (LongAlpaca) uses the longctx variant (micro_bs=2) because
+    LongAlpaca sequences are up to 16K tokens and require smaller
+    micro-batches to fit in H200 memory.
+
+    Selection matrix:
+        8 GPUs → deepspeed_zero2_8gpu.json         (accum=1, micro=8)
+        4 GPUs → deepspeed_zero2_4gpu.json         (accum=2, micro=8)
+        other  → YAML default (let it fail with a clear message if wrong)
+
+    Phase 2 always reads the longctx variant from the trainer itself
+    (train_longalpaca.py hardcodes the longctx path swap), so this
+    function only governs Phase 1 / the orchestrator's --deepspeed-config
+    override.
+    """
+    # Read the YAML to see what it currently points to
+    try:
+        import yaml as _yaml
+        with open(config_file) as f:
+            data = _yaml.safe_load(f)
+        yaml_ds = data.get("deepspeed_config", "")
+    except Exception:
+        yaml_ds = ""
+
+    # Determine the standard config for this GPU count
+    if num_gpus == 8:
+        target = "configs/deepspeed_zero2_8gpu.json"
+    elif num_gpus == 4:
+        target = "configs/deepspeed_zero2_4gpu.json"
+    else:
+        # Unknown GPU count — keep YAML default, let DS validate
+        return yaml_ds
+
+    # If the YAML already points to the correct config, no change needed
+    if yaml_ds.endswith(target):
+        return yaml_ds
+
+    # Build absolute path relative to project root
+    ds_path = PROJECT_ROOT / target
+    if ds_path.exists():
+        logger.info(
+            f"Auto-selected DS config for {num_gpus} GPUs: {target} "
+            f"(YAML default was {yaml_ds})"
+        )
+        return str(ds_path)
+
+    # Fallback: keep YAML default
+    logger.warning(
+        f"Expected DS config {target} not found; using YAML default {yaml_ds}"
+    )
+    return yaml_ds
 
 
 def run_full_sweep(
