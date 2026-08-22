@@ -22,20 +22,41 @@ from pathlib import Path
 
 import torch
 
-from .spectral import CompressionConfig, apply_spectral_compression
-from .spectral.attention import (
-    reset_all_caches,
-    get_compression_stats,
-    create_spectral_dynamic_cache,
-)
-from .training.train_redpajama import train_redpajama
-from .training.train_longalpaca import train_longalpaca
-from .eval.pg19 import evaluate_pg19
-from .eval.proof_pile import evaluate_proof_pile
-from .eval.longbench import evaluate_longbench
-from .eval.efficiency import measure_efficiency
-from .utils.config import load_config
-from .utils.logging_utils import setup_logging
+# Support both `python -m src.run_experiment` and `python src/run_experiment.py`
+# (DeepSpeed launches it as a script, breaking relative imports).
+try:
+    from .spectral import CompressionConfig, apply_spectral_compression
+    from .spectral.attention import (
+        reset_all_caches,
+        get_compression_stats,
+        create_spectral_dynamic_cache,
+    )
+    from .training.train_redpajama import train_redpajama
+    from .training.train_longalpaca import train_longalpaca
+    from .eval.pg19 import evaluate_pg19
+    from .eval.proof_pile import evaluate_proof_pile
+    from .eval.longbench import evaluate_longbench
+    from .eval.efficiency import measure_efficiency
+    from .utils.config import load_config
+    from .utils.logging_utils import setup_logging
+except ImportError:
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+    from src.spectral import CompressionConfig, apply_spectral_compression
+    from src.spectral.attention import (
+        reset_all_caches,
+        get_compression_stats,
+        create_spectral_dynamic_cache,
+    )
+    from src.training.train_redpajama import train_redpajama
+    from src.training.train_longalpaca import train_longalpaca
+    from src.eval.pg19 import evaluate_pg19
+    from src.eval.proof_pile import evaluate_proof_pile
+    from src.eval.longbench import evaluate_longbench
+    from src.eval.efficiency import measure_efficiency
+    from src.utils.config import load_config
+    from src.utils.logging_utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
