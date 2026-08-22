@@ -200,8 +200,12 @@ def train_longalpaca(
         weight_decay=config.weight_decay,
         bf16=True,
         logging_steps=10,
-        save_strategy="epoch",
-        save_total_limit=config.longalpaca_epochs,
+        # Step-based saves: Phase 2 runs 5 epochs (~188 steps each). Per-epoch
+        # saves meant a mid-epoch workspace stop lost up to an entire epoch.
+        # Saving every 100 steps bounds the max re-run to ~10 min.
+        save_strategy="steps",
+        save_steps=100,
+        save_total_limit=5,
         deepspeed=ds_config_path,
         report_to="wandb",
         run_name=f"{config.config_id}_phase2_longalpaca",
@@ -220,11 +224,16 @@ def train_longalpaca(
     # (see train_redpajama.py for full explanation)
     trainer.model_accepts_loss_kwargs = False
 
-    # Auto-resume: check for existing checkpoints in the output_dir
+    # Auto-resume: check for existing checkpoints in the output_dir.
+    # Sort numerically by step (lexicographic sort picks checkpoint-500 over
+    # checkpoint-1000 — see train_redpajama.py for details).
     resume_ckpt = None
     ckpt_base = Path(training_args.output_dir)
     if ckpt_base.exists():
-        checkpoints = sorted(ckpt_base.glob("checkpoint-*"))
+        checkpoints = sorted(
+            ckpt_base.glob("checkpoint-*"),
+            key=lambda p: int(p.name.rsplit("-", 1)[-1]),
+        )
         if checkpoints:
             resume_ckpt = str(checkpoints[-1])
             logger.info(f"Resuming Phase 2 from {resume_ckpt}")

@@ -219,11 +219,16 @@ def train_redpajama(
     # Disabling this reverts to the pre-4.57 loss computation path.
     trainer.model_accepts_loss_kwargs = False
 
-    # Auto-resume: check for existing checkpoints in the output_dir
+    # Auto-resume: check for existing checkpoints in the output_dir.
+    # Sort numerically by step: lexicographic sort picks checkpoint-500 over
+    # checkpoint-1000 (since '5' > '1'), resuming from an older checkpoint.
     resume_ckpt = None
     ckpt_base = Path(training_args.output_dir)
     if ckpt_base.exists():
-        checkpoints = sorted(ckpt_base.glob("checkpoint-*"))
+        checkpoints = sorted(
+            ckpt_base.glob("checkpoint-*"),
+            key=lambda p: int(p.name.rsplit("-", 1)[-1]),
+        )
         if checkpoints:
             resume_ckpt = str(checkpoints[-1])
             logger.info(f"Resuming Phase 1 from {resume_ckpt}")
