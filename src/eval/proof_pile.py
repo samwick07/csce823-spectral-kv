@@ -55,7 +55,7 @@ def evaluate_proof_pile(
     # hoskinson-center/proof-pile has the same data in jsonl.gz format.
     # EleutherAI/proof-pile-2 is the newer version (also jsonl.zst).
     pp_names = [
-        ("hoskinson-center/proof-pile", {"split": "test"}),
+        ("hoskinson-center/proof-pile", {"split": "test", "trust_remote_code": True}),
         ("EleutherAI/proof-pile-2", {"split": "test"}),
         ("EleutherAI/proof-pile", {"split": "test", "trust_remote_code": True}),
     ]

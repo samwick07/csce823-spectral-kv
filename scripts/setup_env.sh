@@ -176,7 +176,7 @@ from datasets import load_dataset
 datasets = [
     ('Yukang/LongAlpaca-12k', 'train', {}),
     ('emozilla/pg19-test', 'test', {}),
-    ('hoskinson-center/proof-pile', 'test', {}),
+    ('hoskinson-center/proof-pile', 'test', {'trust_remote_code': True}),
 ]
 
 for name, split, kwargs in datasets:
