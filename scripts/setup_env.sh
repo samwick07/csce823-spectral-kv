@@ -97,6 +97,16 @@ pip install --upgrade pip setuptools wheel
 header "INSTALLING DEPENDENCIES"
 
 pip install -r requirements.txt
+
+# flash-attn needs --no-build-isolation (it uses the installed torch's
+# CUDA headers). If the build fails (toolchain mismatch), remove it and
+# continue -- the code falls back to PyTorch SDPA automatically.
+pip install flash-attn>=2.5 --no-build-isolation || {
+    echo -e "${YELLOW}flash-attn build failed. Removing from venv.${NC}"
+    echo -e "${YELLOW}The code will fall back to PyTorch SDPA (Fix 2, Path 2).${NC}"
+    pip uninstall flash-attn -y 2>/dev/null || true
+}
+
 echo -e "${GREEN}Dependencies installed.${NC}"
 
 # --- Verify torch + GPU ---
