@@ -198,6 +198,9 @@ def train_longalpaca(
         train_dataset=tokenized,
         data_collator=data_collator,
     )
+    # Transformers 4.57: disable num_items_in_batch loss kwarg injection
+    # (see train_redpajama.py for full explanation)
+    trainer.model_accepts_loss_kwargs = False
 
     # Auto-resume: check for existing checkpoints in the output_dir
     resume_ckpt = None

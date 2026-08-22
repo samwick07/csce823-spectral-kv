@@ -196,6 +196,13 @@ def train_redpajama(
         train_dataset=tokenized,
         data_collator=data_collator,
     )
+    # Transformers 4.57: the Trainer auto-detects **kwargs in the model's
+    # forward signature and injects num_items_in_batch as a loss kwarg.
+    # With PEFT-wrapped models + DeepSpeed ZeRO-2 + gradient checkpointing,
+    # this causes the loss tensor to lose grad_fn, triggering:
+    #   AssertionError: loss must be a scalar tensor
+    # Disabling this reverts to the pre-4.57 loss computation path.
+    trainer.model_accepts_loss_kwargs = False
 
     # Auto-resume: check for existing checkpoints in the output_dir
     resume_ckpt = None
