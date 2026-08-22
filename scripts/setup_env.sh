@@ -83,7 +83,18 @@ if [[ -d "$VENV_DIR" ]]; then
 fi
 
 if [[ ! -d "$VENV_DIR" ]]; then
+    # Ensure python3-venv is installed (missing on minimal Ubuntu/Coder images)
+    if ! python3 -c "import venv" 2>/dev/null; then
+        echo -e "${YELLOW}python3-venv not found. Installing...${NC}"
+        PY_VER=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+        sudo apt-get update -qq && sudo apt-get install -y "python${PY_VER}-venv" 2>/dev/null || \
+        sudo apt-get install -y python3-venv 2>/dev/null || true
+    fi
     python3 -m venv "$VENV_DIR"
+    if [[ ! -f "$VENV_DIR/bin/python" ]]; then
+        echo -e "${RED}Failed to create venv. Try: sudo apt install python3-venv${NC}"
+        exit 1
+    fi
     echo -e "${GREEN}Created venv at $VENV_DIR${NC}"
 fi
 
