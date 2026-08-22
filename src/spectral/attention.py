@@ -149,7 +149,7 @@ def apply_spectral_compression(
     )
 
     # Find all attention layers: LlamaForCausalLM -> model.model.layers[i].self_attn
-    layers = model.model.layers
+    layers = _get_model_layers(model)
     num_layers = len(layers)
     logger.info(f"Found {num_layers} transformer layers")
 
@@ -352,17 +352,45 @@ def _spectral_forward(
     return attn_output, attn_weights
 
 
+def _get_model_layers(model: nn.Module) -> nn.ModuleList:
+    """Get the transformer layer list from a model, handling PEFT wrapping.
+
+    LlamaForCausalLM: model.model.layers
+    PeftModel: model.base_model.model.model.layers
+    LlamaModel: model.layers
+    """
+    # Try direct access first
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        return model.model.layers
+    # PEFT wrapping: PeftModel.base_model is LoraModel,
+    # whose .model is the original LlamaForCausalLM
+    if hasattr(model, "base_model"):
+        inner = model.base_model
+        if hasattr(inner, "model") and hasattr(inner.model, "model"):
+            return inner.model.model.layers
+        if hasattr(inner, "model") and hasattr(inner.model, "layers"):
+            return inner.model.layers
+    # Already a LlamaModel?
+    if hasattr(model, "layers"):
+        return model.layers
+    raise AttributeError(
+        f"Could not find .layers in model of type {type(model).__name__}. "
+        f"Available attrs: {[a for a in dir(model) if not a.startswith('_')]}"
+    )
+
+
 def get_spectral_caches(model: nn.Module) -> list[SpectralKVCache]:
     """Extract all spectral caches from a model (for inspection or logging).
 
     Args:
-        model: A LlamaForCausalLM with spectral compression applied.
+        model: A LlamaForCausalLM (or PeftModel wrapping one) with spectral
+               compression applied.
 
     Returns:
         List of SpectralKVCache objects, one per layer.
     """
     caches = []
-    for layer in model.model.layers:
+    for layer in _get_model_layers(model):
         attn = layer.self_attn
         if hasattr(attn, "spectral_cache"):
             caches.append(attn.spectral_cache)
