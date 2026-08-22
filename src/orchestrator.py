@@ -62,9 +62,8 @@ PILOT_SEEDS = list(range(5))
 def _default_num_seeds() -> int:
     """Full-run seed count from the config YAML (single source of truth).
 
-    The class-project repo uses num_seeds=1 (point estimates); the
-    publication archive uses num_seeds=30. This lets the same orchestrator
-    drive both without a fork.
+    num_seeds defaults to 30 in the YAMLs. Override at runtime with
+    --seeds (e.g. --seeds 0 for a single-seed point-estimate run).
     """
     try:
         import yaml

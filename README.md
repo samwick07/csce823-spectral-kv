@@ -44,7 +44,7 @@ csce823-spectral-kv/
 │   ├── spectral/          # DCT/FFT transforms, filters, compressed attention
 │   ├── training/          # RedPajama + LongAlpaca fine-tuning pipelines
 │   ├── eval/              # PG-19, Proof-pile, LongBench, efficiency metrics
-│   ├── stats/             # Aggregation + 7-step statistical analysis
+│   ├── stats/             # Aggregation, 7-step analysis, point estimates
 │   ├── tests/             # Unit tests + integration smoke tests
 │   ├── utils/             # Config, constants, W&B, manifest, checkpointing
 │   ├── orchestrator.py    # Resilient 4-phase experiment driver
@@ -59,8 +59,7 @@ csce823-spectral-kv/
 
 ## Hardware
 
-- 4x NVIDIA H200 (141 GB HBM3e, 4.8 TB/s bandwidth)
-- 1x AMD EPYC 9004 (96 cores, 192 threads)
+- NVIDIA H200 (141 GB HBM3e, 4.8 TB/s bandwidth)
 - AFIT Center for Cyberspace Research (CCR) AI Cluster
 - Coder workspace at coder.afitcdn.org
 
@@ -71,7 +70,7 @@ csce823-spectral-kv/
 - HuggingFace token with read + write access (set as `HF_TOKEN` env var)
 - Weights & Biases API key (set as `WANDB_API_KEY` env var)
 - Llama-3.1 model license approved on HuggingFace
-- 4x H200 GPUs visible via `nvidia-smi`
+- H200 GPUs visible via `nvidia-smi`
 
 ### One-Time Setup
 
@@ -89,33 +88,36 @@ bash scripts/setup_env.sh
 
 ### Running the Experiment
 
+The seed count is controlled by `num_seeds` in the config YAMLs (default
+30) and can be overridden at runtime with `--seeds`. The analysis phase
+automatically adapts: a single seed produces point estimates
+(`results/point/point_table.md`), while 2+ seeds triggers the full 7-step
+statistical pipeline.
+
 ```bash
-# Pilot run first (3 configs x 5 seeds) -- pipeline validation
+# Pilot run first (3 configs x 5 seeds) — pipeline validation
 bash scripts/run.sh --pilot
 
-# Class-project run: 13 configs x 1 seed (num_seeds=1 in the YAMLs)
+# Full publication run (13 configs x 30 seeds)
 bash scripts/run.sh
 
-# Override the seed list for a partial or ad-hoc run
-bash scripts/run.sh --seeds 0,1
+# Class-project / quick run (13 configs x 1 seed, point estimates only)
+bash scripts/run.sh --seeds 0
+
+# Arbitrary seed subset
+bash scripts/run.sh --seeds 0,1,2
 ```
 
-That is it. `run.sh` launches the orchestrator inside a tmux session that
-survives SSH disconnects and VPN drops. The orchestrator runs 4 phases
+`run.sh` launches the orchestrator inside a tmux session that survives
+SSH disconnects and VPN drops. The orchestrator runs 4 phases
 automatically:
 
 | Phase | Description | Hardware |
 |-------|-------------|----------|
-| 1. Train | 13 configs via DeepSpeed ZeRO-2 | 4x H200 |
-| 2. Eval | 13 runs (13 x 1 seed), 4-way parallel (1 GPU each) | 4x H200 |
-| 3. Analyze | Point-estimate table (single seed -- no significance tests) | CPU |
+| 1. Train | 13 configs via DeepSpeed ZeRO-2 | H200 GPUs |
+| 2. Eval | 13 x N seeds, 4-way parallel (1 GPU each) | H200 GPUs |
+| 3. Analyze | Point estimates (1 seed) or 7-step pipeline (2+ seeds) | CPU |
 | 4. Exfil | Package + upload to HuggingFace Hub | CPU |
-
-The seed count comes from `num_seeds` in the config YAMLs (1 here). With a
-single seed the analysis phase produces `results/point/point_table.md`
-via `src/stats/point_estimates.py` instead of the 7-step pipeline; pass
-2+ seeds via `--seeds` to get the full statistical analysis. The N=30
-publication protocol lives in the archive repository (see below).
 
 ### Monitoring
 
@@ -224,6 +226,12 @@ bash scripts/smoke_test.sh
   16K sequences) uses the `_longctx` variants with micro-batch 2.
   Override with `--deepspeed-config` on `run_experiment.py`.
 
+- **Seed count is a runtime argument**: `num_seeds` in the YAMLs sets the
+  default (30); `--seeds` on `run.sh` overrides it. The analysis phase
+  checks `len(seeds)` at runtime — 1 seed produces point estimates, 2+
+  seeds runs the full 7-step pipeline. No code changes needed to switch
+  between class-project (N=1) and publication (N=30) runs.
+
 - **Centralized model identifiers**: All model name references go through
   `src/utils/constants.py` (`DEFAULT_MODEL_NAME`,
   `SMOKE_TEST_MODEL_NAME`), both pointing to
@@ -233,16 +241,6 @@ bash scripts/smoke_test.sh
   used instead of per-factor Kruskal-Wallis because it correctly detects
   interaction effects — the core research question of whether the benefit
   of learnable filtering depends on transform type.
-
-## Repository Split
-
-This repository (N=1, class-project protocol) is the point-estimate version of
-the experiment: 13 configs, 1 seed, `results/point/point_table.md` is the
-deliverable. The full N=30 publication experiment — 30 seeds per config,
-bootstrap distributions, and the 7-step significance pipeline — is archived
-at [samwick07/spectral-kv](https://github.com/samwick07/spectral-kv)
-and runs with the same entry points (`--seeds` defaults to the full 0-29
-list there).
 
 ## Author
 
