@@ -18,7 +18,7 @@
   "steps_per_print": 10,
   "wall_clock_breakdown": false,
   "optimizer": {
-    "type": "CPUAdam",
+    "type": "AdamW",
     "params": {
       "lr": "auto",
       "betas": [
@@ -26,7 +26,8 @@
         0.999
       ],
       "eps": 1e-08,
-      "weight_decay": 0.01
+      "weight_decay": 0.01,
+      "torch_adam": true
     }
   },
   "scheduler": {
