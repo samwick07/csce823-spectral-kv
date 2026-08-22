@@ -51,10 +51,10 @@ csce823-spectral-kv/
 │   └── run_experiment.py  # Single-config train/eval entry point
 ├── configs/               # 13 experiment YAMLs + DeepSpeed ZeRO-2 configs
 ├── scripts/               # run.sh, setup_env.sh, exfil.sh, monitor.sh, smoke_test.sh
-├── tests/                 # Spectral transform unit tests (28 tests)
+├── tests/                 # Spectral transform unit tests (43 tests)
 ├── results/               # Generated: raw evals, aggregated CSVs, stats, manifest
 ├── checkpoints/           # Generated: DeepSpeed checkpoints + LoRA adapters
-└── docs/                  # Compute resources, dataset verification, reexamination
+└── docs/                  # Compute resources, dataset verification, design decisions
 ```
 
 ## Hardware
@@ -63,7 +63,6 @@ csce823-spectral-kv/
 - 1x AMD EPYC 9004 (96 cores, 192 threads)
 - AFIT Center for Cyberspace Research (CCR) AI Cluster
 - Coder workspace at coder.afitcdn.org
-- Estimated: ~1,278 GPU-hours, ~14 days wall clock
 
 ## Quick Start (Cluster Deployment)
 
@@ -91,26 +90,26 @@ bash scripts/setup_env.sh
 ### Running the Experiment
 
 ```bash
-# Pilot run first (3 configs x 5 seeds, ~22 hours) -- pipeline validation
+# Pilot run first (3 configs x 5 seeds) -- pipeline validation
 bash scripts/run.sh --pilot
 
-# Class-project run: 13 configs x 1 seed (num_seeds=1 in the YAMLs), ~7 days
+# Class-project run: 13 configs x 1 seed (num_seeds=1 in the YAMLs)
 bash scripts/run.sh
 
 # Override the seed list for a partial or ad-hoc run
 bash scripts/run.sh --seeds 0,1
 ```
 
-That's it. `run.sh` launches the orchestrator inside a tmux session that
+That is it. `run.sh` launches the orchestrator inside a tmux session that
 survives SSH disconnects and VPN drops. The orchestrator runs 4 phases
 automatically:
 
-| Phase | Description | Hardware | Duration |
-|-------|-------------|----------|----------|
-| 1. Train | 13 configs via DeepSpeed ZeRO-2 | 4x H200 | ~5-6.5 days |
-| 2. Eval | 13 runs (13 x 1 seed), 4-way parallel (1 GPU each) | 4x H200 | ~1.5 days |
-| 3. Analyze | Point-estimate table (single seed -- no significance tests) | CPU | seconds |
-| 4. Exfil | Package + upload to HuggingFace Hub | CPU | minutes |
+| Phase | Description | Hardware |
+|-------|-------------|----------|
+| 1. Train | 13 configs via DeepSpeed ZeRO-2 | 4x H200 |
+| 2. Eval | 13 runs (13 x 1 seed), 4-way parallel (1 GPU each) | 4x H200 |
+| 3. Analyze | Point-estimate table (single seed -- no significance tests) | CPU |
+| 4. Exfil | Package + upload to HuggingFace Hub | CPU |
 
 The seed count comes from `num_seeds` in the config YAMLs (1 here). With a
 single seed the analysis phase produces `results/point/point_table.md`
@@ -217,10 +216,13 @@ bash scripts/smoke_test.sh
   forward pass (which overrides `LlamaAttention.forward` with manual SDPA).
   Removed `flash-attn` from requirements; using `attn_implementation="eager"`.
 
-- **4-GPU DeepSpeed configs**: `deepspeed_zero2_4gpu.json` and
-  `deepspeed_zero2_4gpu_longctx.json` with `train_batch_size=64`
-  (8 micro-batch per GPU x 4 GPUs x 2 gradient accumulation),
-  preserving the FreqKV-protocol global batch of 64.
+- **DeepSpeed config auto-selection**: The orchestrator detects the GPU
+  count at runtime and selects the matching DeepSpeed ZeRO-2 config
+  (`deepspeed_zero2_4gpu.json` for 4 GPUs, `deepspeed_zero2_8gpu.json`
+  for 8 GPUs). All configs preserve a global batch size of 64
+  (micro-batch 8 x N GPUs x accumulation steps). Phase 2 (LongAlpaca,
+  16K sequences) uses the `_longctx` variants with micro-batch 2.
+  Override with `--deepspeed-config` on `run_experiment.py`.
 
 - **Centralized model identifiers**: All model name references go through
   `src/utils/constants.py` (`DEFAULT_MODEL_NAME`,
@@ -236,11 +238,11 @@ bash scripts/smoke_test.sh
 
 This repository (N=1, class-project protocol) is the point-estimate version of
 the experiment: 13 configs, 1 seed, `results/point/point_table.md` is the
-deliverable. The full N=30 publication experiment -- 30 seeds per config,
-bootstrap distributions, and the 7-step significance pipeline -- is archived
-unchanged at [samwick07/spectral-kv](https://github.com/samwick07/spectral-kv)
-(tag `n30-v1.0`) and runs with the same entry points (`--seeds` defaults to
-the full 0-29 list there).
+deliverable. The full N=30 publication experiment — 30 seeds per config,
+bootstrap distributions, and the 7-step significance pipeline — is archived
+at [samwick07/spectral-kv](https://github.com/samwick07/spectral-kv)
+and runs with the same entry points (`--seeds` defaults to the full 0-29
+list there).
 
 ## Author
 
