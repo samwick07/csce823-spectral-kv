@@ -346,8 +346,10 @@ def _spectral_forward(
     attn_output = attn_output.reshape(bsz, q_len, num_q_heads * head_dim)
     attn_output = attn_module.o_proj(attn_output)
 
-    # Return in HF's expected format: (output, attn_weights, past_key_value)
-    return attn_output, attn_weights, past_key_value
+    # Return in HF's expected format.
+    # transformers <4.50: (attn_output, attn_weights, past_key_value)
+    # transformers >=4.50: (attn_output, attn_weights) — cache updated in-place
+    return attn_output, attn_weights
 
 
 def get_spectral_caches(model: nn.Module) -> list[SpectralKVCache]:
