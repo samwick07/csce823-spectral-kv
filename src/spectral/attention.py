@@ -156,9 +156,16 @@ def apply_spectral_compression(
     for i, layer in enumerate(layers):
         attn = layer.self_attn
 
-        # Read architecture constants from the attention module
-        num_kv_heads = attn.num_key_value_heads
-        head_dim = attn.head_dim
+        # Read architecture constants from the attention module.
+        # In transformers <4.50 these live on attn; in >=4.50 they moved
+        # to the model config. Try both for compatibility.
+        num_kv_heads = getattr(attn, "num_key_value_heads", None)
+        if num_kv_heads is None:
+            num_kv_heads = model.config.num_key_value_heads
+        head_dim = getattr(attn, "head_dim", None)
+        if head_dim is None:
+            head_dim = model.config.head_dim if hasattr(model.config, "head_dim") else \
+                       model.config.hidden_size // model.config.num_attention_heads
 
         # Create spectral cache for this layer
         spectral_cache = SpectralKVCache(config, num_kv_heads, head_dim)
@@ -244,9 +251,17 @@ def _spectral_forward(
     key_states = attn_module.k_proj(hidden_states)
     value_states = attn_module.v_proj(hidden_states)
 
-    num_q_heads = attn_module.num_heads
-    num_kv_heads = attn_module.num_key_value_heads
-    head_dim = attn_module.head_dim
+    # Read architecture constants with fallbacks for transformers >=4.50
+    num_q_heads = getattr(attn_module, "num_heads", None)
+    if num_q_heads is None:
+        num_q_heads = attn_module.config.num_attention_heads
+    num_kv_heads = getattr(attn_module, "num_key_value_heads", None)
+    if num_kv_heads is None:
+        num_kv_heads = attn_module.config.num_key_value_heads
+    head_dim = getattr(attn_module, "head_dim", None)
+    if head_dim is None:
+        cfg = attn_module.config
+        head_dim = getattr(cfg, "head_dim", None) or (cfg.hidden_size // cfg.num_attention_heads)
 
     # Reshape to [B, num_heads, S, head_dim]
     query_states = query_states.view(bsz, q_len, num_q_heads, head_dim).transpose(1, 2)
