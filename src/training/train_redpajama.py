@@ -96,6 +96,13 @@ def train_redpajama(
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
+    # PEFT + gradient checkpointing: the checkpointing logic freezes input
+    # embeddings to save memory, but LoRA only trains adapter weights — so
+    # without enable_input_require_grads() the backward chain breaks at the
+    # frozen embeddings and the loss tensor loses grad_fn. DeepSpeed then
+    # asserts "loss must be a scalar tensor" because grad_fn is None.
+    model.enable_input_require_grads()
+
     # 5. Initialize W&B for this phase (deterministic ID for crash recovery)
     try:
         from ..utils.wandb_utils import init_wandb, finish_wandb

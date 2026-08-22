@@ -92,6 +92,10 @@ def train_longalpaca(
     model = PeftModel.from_pretrained(model, phase1_checkpoint)
     logger.info(f"Loaded Phase 1 LoRA adapters from {phase1_checkpoint}")
 
+    # PEFT + gradient checkpointing: preserve backward chain through frozen
+    # embeddings (see train_redpajama.py for full explanation)
+    model.enable_input_require_grads()
+
     # 5. Initialize W&B for this phase (deterministic ID for crash recovery)
     try:
         from ..utils.wandb_utils import init_wandb, finish_wandb
