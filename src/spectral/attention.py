@@ -20,6 +20,11 @@ The learnable filter (if present) is updated via backpropagation.
 
 For GQA: Llama-3.1-8B uses 32 query heads and 8 KV heads. Compression is
 applied only to the 8 KV heads. Query heads are never compressed.
+
+Generation uses K=1 incremental caching via SpectralDynamicCache:
+  - Prefill: compress full prompt K/V into spectral domain.
+  - Decode: append one token, reconstruct old + new, recompress.
+  This makes generation O(N log N) per step instead of O(N^2).
 """
 
 from __future__ import annotations
@@ -32,11 +37,88 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .cache import CompressionConfig, SpectralKVCache
+from .cache import CompressionConfig, SpectralKVCache, SpectralDynamicCache
 from .transform import SpectralTransform, DCTTransform, FFTTransform
 from .filter import SpectralFilter, FixedLowPassFilter, LearnableSpectralFilter
 
 logger = logging.getLogger(__name__)
+
+# Try to import FlashAttention-2 (Fix 2)
+try:
+    from flash_attn import flash_attn_func
+    _HAS_FLASH_ATTN = True
+except ImportError:
+    _HAS_FLASH_ATTN = False
+    logger.debug("flash_attn not available. Using manual attention.")
+
+# Try to import SDPA as a fallback for FA2
+try:
+    from torch.nn.functional import scaled_dot_product_attention as _sdpa
+    _HAS_SDPA = True
+except ImportError:
+    _HAS_SDPA = False
+
+
+def _compute_attention(
+    query_states: torch.Tensor,
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    use_flash: bool = True,
+) -> torch.Tensor:
+    """Compute attention with FlashAttention-2 if available, else manual.
+
+    Fix 2: After spectral reconstruction, K/V are standard tensors.
+    Use FA2 for fused Q@K^T + softmax + @V to get 2-4x speedup.
+    Falls back to SDPA, then to manual attention.
+
+    Args:
+        query_states: [B, num_q_heads, S_q, head_dim]
+        key_states: [B, num_q_heads, S_kv, head_dim] (already repeated for GQA)
+        value_states: [B, num_q_heads, S_kv, head_dim] (already repeated for GQA)
+        attention_mask: [B, 1, 1, S_kv] or None
+        use_flash: If True and FA2 is available, use it.
+    """
+    bsz, num_heads, q_len, head_dim = query_states.shape
+    kv_len = key_states.shape[-2]
+
+    # Path 1: FlashAttention-2 (fastest)
+    # FA2 expects [B, S, H, D] layout (not [B, H, S, D])
+    if use_flash and _HAS_FLASH_ATTN and q_len > 1:
+        try:
+            q_fa2 = query_states.transpose(1, 2)  # [B, S_q, H, D]
+            k_fa2 = key_states.transpose(1, 2)    # [B, S_kv, H, D]
+            v_fa2 = value_states.transpose(1, 2)  # [B, S_kv, H, D]
+            output = flash_attn_func(q_fa2, k_fa2, v_fa2, causal=True)
+            return output.transpose(1, 2)  # back to [B, H, S_q, D]
+        except Exception as e:
+            logger.debug_once(f"flash_attn_func failed ({e}), falling back")
+
+    # Path 2: PyTorch SDPA (almost as fast, no external dep)
+    if use_flash and _HAS_SDPA:
+        try:
+            # SDPA handles causal mask internally if we pass is_causal=True
+            # For decode (q_len=1), is_causal is a no-op
+            is_causal = (q_len > 1) and (q_len == kv_len)
+            output = _sdpa(
+                query_states, key_states, value_states,
+                attn_mask=attention_mask if not is_causal else None,
+                is_causal=is_causal,
+            )
+            return output
+        except Exception as e:
+            logger.debug_once(f"SDPA failed ({e}), falling back to manual")
+
+    # Path 3: Manual attention (original implementation, always works)
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
+
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    # Softmax in float32 for numerical stability
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_output = torch.matmul(attn_weights, value_states)
+    return attn_output
 
 
 def apply_spectral_compression(
@@ -144,6 +226,11 @@ def _spectral_forward(
 
     Handles both older transformers (rotary_emb on the attention module) and
     newer versions (position_embeddings passed as kwargs).
+
+    Generation flow (with SpectralDynamicCache):
+      - Prefill (q_len > 1): compress full K/V, reconstruct, attend.
+      - Decode (q_len == 1): append new K/V via cache, get full K/V, attend.
+    This reduces generation from O(N^2) to O(N log N) per step.
     """
     from transformers.models.llama.modeling_llama import (
         apply_rotary_pos_emb,
@@ -183,40 +270,65 @@ def _spectral_forward(
             f"Pass position_embeddings=(cos, sin) or ensure rotary_emb is set."
         )
 
-    # 3. [SPECTRAL] Compress K, V into spectral domain
-    #    Transform -> Filter -> Truncate -> Store compressed coefficients
-    spectral_cache.compress(key_states, value_states)
+    # 3. [SPECTRAL] Compress or append K/V
+    #
+    # Generation path: if past_key_value is a SpectralDynamicCache,
+    # use the Cache protocol for incremental updates (K=1).
+    # Training path: always compress full sequence (no cache reuse).
+    is_decode_step = (
+        isinstance(past_key_value, SpectralDynamicCache)
+        and q_len == 1
+        and past_key_value.get_seq_length(layer_idx) > 0
+    )
 
-    # 4. [SPECTRAL] Reconstruct K, V from compressed spectral representation
-    #    This is the lossy reconstruction that the model learns to work with
-    key_states, value_states = spectral_cache.reconstruct(target_seq_len=q_len)
+    if is_decode_step:
+        # Decode: append new token's K/V, get full reconstructed K/V back
+        key_states, value_states = past_key_value.update(
+            key_states, value_states, layer_idx
+        )
+    else:
+        # Prefill or training: compress full sequence
+        spectral_cache.compress(key_states, value_states)
 
-    # 5. Repeat KV heads for GQA (8 KV heads -> 32 query heads)
+        # Reconstruct from compressed spectral representation
+        key_states, value_states = spectral_cache.reconstruct(target_seq_len=q_len)
+
+        # If using a SpectralDynamicCache, update it so future decode
+        # steps know the cache is populated
+        if isinstance(past_key_value, SpectralDynamicCache):
+            # The compress() call above already populated spectral_cache;
+            # SpectralDynamicCache just needs to know seq_length is nonzero.
+            pass
+
+    # 4. Repeat KV heads for GQA (8 KV heads -> 32 query heads)
     key_states = repeat_kv(key_states, num_q_heads // num_kv_heads)
     value_states = repeat_kv(value_states, num_q_heads // num_kv_heads)
 
-    # 6. Compute attention: Q @ K^T / sqrt(d)
-    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
+    # 5. Compute attention (Fix 2: use FlashAttention-2 / SDPA if available)
+    attn_output = _compute_attention(
+        query_states, key_states, value_states,
+        attention_mask=attention_mask,
+        use_flash=not output_attentions,
+    )
 
-    # Apply attention mask (causal mask from HF is [B, 1, 1, S])
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
+    # If output_attentions is requested, recompute with manual attention
+    # (FA2/SDPA don't return attention weights)
+    if output_attentions:
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+    else:
+        attn_weights = None
 
-    # Softmax in float32 for numerical stability
-    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-
-    # Apply attention to values
-    attn_output = torch.matmul(attn_weights, value_states)
-
-    # 7. Reshape and output projection
+    # 6. Reshape and output projection
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(bsz, q_len, num_q_heads * head_dim)
     attn_output = attn_module.o_proj(attn_output)
 
     # Return in HF's expected format: (output, attn_weights, past_key_value)
-    if output_attentions:
-        return attn_output, attn_weights, past_key_value
-    return attn_output, None, past_key_value
+    return attn_output, attn_weights, past_key_value
 
 
 def get_spectral_caches(model: nn.Module) -> list[SpectralKVCache]:
@@ -282,6 +394,22 @@ def reset_all_caches(model: nn.Module) -> None:
     """
     for cache in get_spectral_caches(model):
         cache.reset()
+
+
+def create_spectral_dynamic_cache(model: nn.Module) -> SpectralDynamicCache:
+    """Create a SpectralDynamicCache wrapping the model's per-layer caches.
+
+    Pass this to model.generate(past_key_value=...) so that HF's generation
+    loop passes only the new token at each decode step instead of the full
+    sequence. This is what activates the K=1 incremental caching path.
+
+    Args:
+        model: A LlamaForCausalLM with spectral compression applied.
+
+    Returns:
+        A SpectralDynamicCache ready to pass to generate().
+    """
+    return SpectralDynamicCache(get_spectral_caches(model))
 
 
 # Backward compatibility with the old API

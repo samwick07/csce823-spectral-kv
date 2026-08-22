@@ -89,13 +89,64 @@ class DCTTransform(SpectralTransform):
     """Discrete Cosine Transform (DCT-II) for KV-cache compression.
 
     This is the FreqKV baseline transform. The DCT is real-valued and
-    discards phase information. Implemented via torch.fft.dct / idct
-    (available in PyTorch >= 2.1) or a manual FFT-based DCT algorithm.
+    discards phase information. Implemented via a manual FFT-based DCT algorithm.
 
     The DCT produces N real coefficients for a length-N input. After
     truncation to gamma*N coefficients, the inverse DCT must zero-pad
     back to N coefficients before reconstructing.
+
+    Fix 4: DCT index/phase tensors are precomputed and cached as
+    non-persistent buffers keyed by (N, device) to avoid recomputing
+    them on every forward/inverse call.
     """
+
+    def __init__(self, dim: int = -2):
+        super().__init__(dim=dim)
+        # Cache for precomputed tensors: {(N, device): (perm, phase, mirror_idx)}
+        # These are NOT nn buffers (they vary by N); they are memoized per-call.
+        self._fwd_cache: dict = {}
+        self._inv_cache: dict = {}
+
+    def _get_fwd_constants(self, N: int, device: torch.device, dtype: torch.dtype):
+        """Get or precompute forward DCT constants for length N.
+
+        Returns:
+            (perm, phase) where:
+              perm: interleaving permutation indices [N]
+              phase: DCT-II phase factors [N] (complex)
+        """
+        key = (N, str(device))
+        if key not in self._fwd_cache:
+            even_idx = torch.arange(0, N, 2, device=device)
+            odd_idx = torch.arange(1, N, 2, device=device)
+            perm = torch.cat([even_idx, odd_idx.flip(0)])
+            k = torch.arange(N, device=device, dtype=dtype)
+            phase = torch.exp(-1j * torch.pi * k / (2 * N))
+            self._fwd_cache[key] = (perm, phase)
+        return self._fwd_cache[key]
+
+    def _get_inv_constants(self, N: int, device: torch.device, dtype: torch.dtype):
+        """Get or precompute inverse DCT constants for length N.
+
+        Returns:
+            (mirror_idx, phase, even_idx, odd_idx) where:
+              mirror_idx: mirror permutation for Hermitian reconstruction [N]
+              phase: inverse DCT phase factors [N] (complex)
+              even_idx: even indices for de-interleaving [N//2 or (N+1)//2]
+              odd_idx: odd indices for de-interleaving [N//2]
+        """
+        key = (N, str(device))
+        if key not in self._inv_cache:
+            mirror_idx = torch.cat([
+                torch.zeros(1, dtype=torch.long, device=device),
+                torch.arange(N - 1, 0, -1, device=device),
+            ])
+            k = torch.arange(N, device=device, dtype=dtype)
+            phase = torch.exp(1j * torch.pi * k / (2 * N))
+            even_idx = torch.arange(0, N, 2, device=device)
+            odd_idx = torch.arange(1, N, 2, device=device)
+            self._inv_cache[key] = (mirror_idx, phase, even_idx, odd_idx)
+        return self._inv_cache[key]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply DCT-II along the sequence dimension.
@@ -110,18 +161,15 @@ class DCTTransform(SpectralTransform):
         N = x.shape[self.dim]
         dim = self.dim if self.dim >= 0 else x.ndim + self.dim
 
-        # Interleave: v = [x_0, x_2, x_4, ..., x_{N-1}, x_{N-2}, ..., x_1]
-        even_idx = torch.arange(0, N, 2, device=x.device)
-        odd_idx = torch.arange(1, N, 2, device=x.device)
-        perm = torch.cat([even_idx, odd_idx.flip(0)])
+        # Use precomputed constants (Fix 4)
+        perm, phase = self._get_fwd_constants(N, x.device, x.dtype)
+
         v = x.index_select(dim, perm)
 
         # Apply complex FFT
         V = torch.fft.fft(v, dim=dim)
 
         # Multiply by phase factors to get DCT-II coefficients
-        k = torch.arange(N, device=x.device, dtype=x.dtype)
-        phase = torch.exp(-1j * torch.pi * k / (2 * N))
         shape = [1] * x.ndim
         shape[dim] = N
         phase = phase.reshape(shape)
@@ -168,12 +216,12 @@ class DCTTransform(SpectralTransform):
         N = target_len
         dim = self.dim if self.dim >= 0 else x_spectral.ndim + self.dim
 
+        # Use precomputed constants (Fix 4)
+        mirror_idx, phase, even_idx, odd_idx = self._get_inv_constants(
+            N, x_spectral.device, x_spectral.dtype
+        )
+
         # Build the mirror index: X_mirror[k] = X_{N-k} for k=1..N-1, 0 for k=0
-        # mirror_idx = [0, N-1, N-2, ..., 1]
-        mirror_idx = torch.cat([
-            torch.zeros(1, dtype=torch.long, device=x_spectral.device),
-            torch.arange(N - 1, 0, -1, device=x_spectral.device),
-        ])
         X_mirror = x_spectral.index_select(dim, mirror_idx)
         # Zero out position 0 (Im(W_0) = 0)
         zero_sel = [slice(None)] * x_spectral.ndim
@@ -184,8 +232,6 @@ class DCTTransform(SpectralTransform):
         W = torch.complex(x_spectral, -X_mirror)
 
         # Apply phase: V = W * exp(j*pi*k/(2N))
-        k = torch.arange(N, device=x_spectral.device, dtype=x_spectral.dtype)
-        phase = torch.exp(1j * torch.pi * k / (2 * N))
         shape = [1] * x_spectral.ndim
         shape[dim] = N
         phase = phase.reshape(shape)
@@ -196,8 +242,6 @@ class DCTTransform(SpectralTransform):
 
         # Undo interleaving: v = [x_0, x_2, ..., x_{N-1}, x_{N-2}, ..., x_1]
         half = (N + 1) // 2
-        even_idx = torch.arange(0, N, 2, device=x_spectral.device)
-        odd_idx = torch.arange(1, N, 2, device=x_spectral.device)
         x = torch.empty_like(x_spectral)
         even_sel = [slice(None)] * x_spectral.ndim
         even_sel[dim] = even_idx

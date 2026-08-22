@@ -544,15 +544,15 @@ def run_full_sweep(
 
     # --- Phase 2: Evaluation ---
     if phase in ("eval", "full") and not _shutdown_requested:
-        # Distribute eval across GPUs
-        # Strategy: iterate configs, for each config run seeds in parallel
-        # across available GPUs (up to num_gpus at a time).
-        for config_id in config_ids:
-            if _shutdown_requested:
-                logger.warning("Shutdown requested. Exiting.")
-                all_complete = False
-                break
+        # Fix 5: Flat work queue -- distribute (config_id, seed) pairs across
+        # GPUs regardless of which config they belong to. For N=1 this means
+        # ceil(13/4)=4 rounds instead of 13 sequential rounds.
+        # Previous behavior: outer loop over configs (sequential), inner loop
+        # over seeds (parallel). For N=1 this left 3 of 4 GPUs idle.
 
+        # Build flat work queue of (config_id, seed) pairs
+        eval_queue: list[tuple[str, int]] = []
+        for config_id in config_ids:
             # Skip eval if training isn't done (unless it's baseline C00)
             if config_id != "C00" and not is_training_complete(config_id):
                 logger.warning(f"[{config_id}] Training not complete, "
@@ -560,38 +560,46 @@ def run_full_sweep(
                 all_complete = False
                 continue
 
+            for seed in seeds:
+                eval_key = f"{config_id}_seed{seed}"
+                if eval_key in state["completed_evals"]:
+                    continue
+                if is_eval_complete(config_id, seed):
+                    if eval_key not in state["completed_evals"]:
+                        state["completed_evals"].append(eval_key)
+                        save_state(state)
+                    continue
+                eval_queue.append((config_id, seed))
+
+        # Skip already-completed configs
+        if not eval_queue:
+            logger.info("All evals already complete, skipping eval phase.")
+        else:
+            total_evals = len(eval_queue)
             logger.info(f"\n{'='*60}")
-            logger.info(f"  EVALUATING: {config_id} ({len(seeds)} seeds)")
+            logger.info(f"  EVALUATION: {total_evals} runs across {num_gpus} GPUs")
+            logger.info(f"  (flat work queue: {total_evals} jobs, "
+                        f"{(total_evals + num_gpus - 1) // num_gpus} rounds)")
             logger.info(f"{'='*60}")
 
-            remaining_seeds = [
-                s for s in seeds
-                if f"{config_id}_seed{s}" not in state["completed_evals"]
-                and not is_eval_complete(config_id, s)
-            ]
-
-            if not remaining_seeds:
-                logger.info(f"[{config_id}] All evals complete, skipping.")
-                continue
-
-            logger.info(f"[{config_id}] {len(remaining_seeds)}/{len(seeds)} "
-                        f"seeds remaining.")
-
-            # Run seeds in parallel batches across GPUs
-            batch_size = min(num_gpus, len(remaining_seeds))
-            for batch_start in range(0, len(remaining_seeds), batch_size):
+            # Dispatch in batches of num_gpus
+            batch_size = min(num_gpus, len(eval_queue))
+            for batch_start in range(0, len(eval_queue), batch_size):
                 if _shutdown_requested:
                     all_complete = False
                     break
 
-                batch = remaining_seeds[batch_start:batch_start + batch_size]
-                logger.info(f"[{config_id}] Launching batch of {len(batch)} "
-                            f"evals on GPUs 0-{len(batch)-1}")
+                batch = eval_queue[batch_start:batch_start + batch_size]
+                batch_num = batch_start // batch_size + 1
+                total_batches = (len(eval_queue) + batch_size - 1) // batch_size
+                logger.info(f"\n  Eval batch {batch_num}/{total_batches}: "
+                            f"{len(batch)} jobs on GPUs 0-{len(batch)-1}")
 
                 # Launch all evals in this batch as parallel subprocesses
-                procs: list[tuple[int, int, subprocess.Popen]] = []  # (seed, gpu_id, proc)
+                # Each entry: (config_id, seed, gpu_id, proc)
+                procs: list[tuple[str, int, int, subprocess.Popen]] = []
 
-                for gpu_id, seed in enumerate(batch):
+                for gpu_id, (config_id, seed) in enumerate(batch):
                     task = f"eval_{config_id}_seed{seed}"
                     state["current_task"] = task
                     save_state(state)
@@ -624,13 +632,13 @@ def run_full_sweep(
                             bufsize=1,
                             env=proc_env,
                         )
-                        procs.append((seed, gpu_id, p))
+                        procs.append((config_id, seed, gpu_id, p))
                     except Exception as e:
                         logger.error(f"[GPU{gpu_id}] Failed to start eval subprocess: {e}")
                         all_complete = False
 
                 # Wait for all parallel procs to complete, streaming output
-                for seed, gpu_id, p in procs:
+                for config_id, seed, gpu_id, p in procs:
                     try:
                         for line in p.stdout:  # type: ignore[union-attr]
                             line = line.rstrip()

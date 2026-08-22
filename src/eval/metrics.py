@@ -130,6 +130,7 @@ def compute_efficiency_metrics(
     input_ids: torch.Tensor,
     generate_length: int = 128,
     device: str = "cuda",
+    past_key_value=None,
 ) -> EfficiencyMetrics:
     """Measure efficiency metrics: memory, latency, overhead.
 
@@ -138,6 +139,7 @@ def compute_efficiency_metrics(
         input_ids: Prompt token IDs [1, prompt_len].
         generate_length: Number of tokens to generate for latency measurement.
         device: Device to run on.
+        past_key_value: Optional SpectralDynamicCache for incremental KV caching.
 
     Returns:
         EfficiencyMetrics with measured values.
@@ -148,15 +150,24 @@ def compute_efficiency_metrics(
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize()
 
+    # Reset cache if provided
+    if past_key_value is not None:
+        past_key_value.reset()
+
     # Measure generation latency
     start_time = time.perf_counter()
 
     with torch.no_grad():
-        outputs = model.generate(
-            input_ids.to(device),
+        gen_kwargs = dict(
             max_new_tokens=generate_length,
             do_sample=False,
             use_cache=True,
+        )
+        if past_key_value is not None:
+            gen_kwargs["past_key_value"] = past_key_value
+        outputs = model.generate(
+            input_ids.to(device),
+            **gen_kwargs,
         )
 
     torch.cuda.synchronize()

@@ -56,6 +56,7 @@ def evaluate_longbench(
     hf_token: str | None = None,
     longbench_dir: str | None = None,
     num_samples: int | None = None,
+    past_key_value=None,
 ) -> dict:
     """Evaluate model on LongBench V1 benchmark.
 
@@ -73,6 +74,10 @@ def evaluate_longbench(
         longbench_dir: Path to LongBench evaluation code (for metrics).
         num_samples: If set, evaluate only the first N samples per task
                      (useful for smoke tests). None = full dataset.
+        past_key_value: Optional SpectralDynamicCache for incremental
+                        KV caching during generation. If provided,
+                        enables K=1 incremental updates (O(N log N) per
+                        step instead of O(N^2)).
 
     Returns:
         Dict with per-task accuracy scores.
@@ -129,15 +134,21 @@ def evaluate_longbench(
                     max_length=task_info["max_length"],
                 ).input_ids.to(device)
 
+                # Reset spectral cache between samples
+                if past_key_value is not None:
+                    past_key_value.reset()
+
                 # Generate with stochastic decoding
                 with torch.no_grad():
-                    output = model.generate(
-                        input_ids,
+                    gen_kwargs = dict(
                         max_new_tokens=max_new_tokens,
                         do_sample=True,
                         temperature=temperature,
                         top_p=top_p,
                     )
+                    if past_key_value is not None:
+                        gen_kwargs["past_key_value"] = past_key_value
+                    output = model.generate(input_ids, **gen_kwargs)
 
                 generated = tokenizer.decode(
                     output[0, input_ids.shape[1]:],

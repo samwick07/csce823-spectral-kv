@@ -19,6 +19,7 @@ def measure_efficiency(
     generate_length: int = 128,
     device: str = "cuda",
     baseline_time: float | None = None,
+    past_key_value=None,
 ) -> EfficiencyMetrics:
     """Measure efficiency metrics for a compressed model.
 
@@ -29,6 +30,7 @@ def measure_efficiency(
         generate_length: Number of tokens to generate.
         device: Device to run on.
         baseline_time: Decoding time of the uncompressed baseline (for overhead calc).
+        past_key_value: Optional SpectralDynamicCache for incremental KV caching.
 
     Returns:
         EfficiencyMetrics with measured values.
@@ -40,6 +42,7 @@ def measure_efficiency(
         input_ids=input_ids,
         generate_length=generate_length,
         device=device,
+        past_key_value=past_key_value,
     )
 
     # Compute compression overhead relative to baseline

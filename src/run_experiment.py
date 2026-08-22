@@ -23,7 +23,11 @@ from pathlib import Path
 import torch
 
 from .spectral import CompressionConfig, apply_spectral_compression
-from .spectral.attention import reset_all_caches, get_compression_stats
+from .spectral.attention import (
+    reset_all_caches,
+    get_compression_stats,
+    create_spectral_dynamic_cache,
+)
 from .training.train_redpajama import train_redpajama
 from .training.train_longalpaca import train_longalpaca
 from .eval.pg19 import evaluate_pg19
@@ -140,6 +144,14 @@ def run_evaluation(
     for s in stats[:3]:  # Log first 3 layers
         logger.info(f"  Layer {s['layer']}: ratio={s['compression_ratio']:.4f}")
 
+    # Create SpectralDynamicCache for incremental KV caching during generation.
+    # This makes HF's generate() pass only the new token at each decode step
+    # (K=1 incremental caching), reducing generation from O(N^2) to O(N log N).
+    # For baseline configs (no compression), this is None (HF uses its own DynamicCache).
+    spectral_cache = create_spectral_dynamic_cache(model) if not config.is_baseline else None
+    if spectral_cache is not None:
+        logger.info("SpectralDynamicCache enabled for incremental generation (K=1)")
+
     all_results = {
         "config_id": config.config_id,
         "seed": seed,
@@ -202,6 +214,7 @@ def run_evaluation(
         top_p=config.eval_top_p,
         seed=seed,
         hf_token=hf_token,
+        past_key_value=spectral_cache,
     )
     all_results["longbench"] = longbench_results
     if use_wandb:
@@ -219,6 +232,7 @@ def run_evaluation(
         tokenizer=tokenizer,
         prompt=prompt,
         generate_length=128,
+        past_key_value=spectral_cache,
     )
     all_results["efficiency"] = {
         "peak_kv_memory_gb": efficiency_metrics.peak_kv_memory_gb,
