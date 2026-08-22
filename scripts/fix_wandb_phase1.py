@@ -28,8 +28,8 @@ import sys
 from pathlib import Path
 
 WANDB_PROJECT = "csce823-spectral-kv"
-RUN_ID = "C00_phase1_redpajama"
-RUN_NAME = "C00_phase1_redpajama"
+RUN_ID = "C00_phase1_redpajama_clean"
+RUN_NAME = "C00 Phase 1 RedPajama (clean re-log)"
 METRICS_FILE = "c00_phase1_clean_metrics.txt"
 
 
