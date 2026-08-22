@@ -4,8 +4,10 @@ transformers>=4.43
 peft>=0.12
 deepspeed>=0.15
 # FlashAttention-2 for post-spectral-reconstruction attention (Fix 2).
-# If build fails, setup_env.sh falls back to PyTorch SDPA automatically.
-flash-attn>=2.5
+# NOT in requirements.txt because pip build isolation breaks it (setup.py
+# imports torch). Installed separately by setup_env.sh with --no-build-isolation
+# after torch is already in the venv. If build fails, falls back to SDPA.
+# flash-attn>=2.5
 datasets>=2.20
 accelerate>=0.34
 
