@@ -301,6 +301,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run a spectral KV-cache compression experiment"
     )
+    # --local_rank is injected by DeepSpeed launcher; accept and ignore it
+    # (DeepSpeed sets LOCAL_RANK env var, which transformers reads).
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=None,
+        help="Local rank (injected by DeepSpeed, set automatically via env)",
+    )
     parser.add_argument(
         "--config",
         type=str,
