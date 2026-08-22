@@ -142,12 +142,20 @@ def train_redpajama(
             + ", ".join(d[0] for d in rp_datasets)
         )
 
+    # Phase 1 RedPajama: use 2048-token sequences for CPT.
+    # The config's max_seq_len (16384) is for Phase 2 long-context training.
+    # Using 16384 here with batch_size=8 + eager attention would require
+    # ~136 GiB for attention weights alone (32 heads × 16384² × 2 bytes),
+    # causing CUDA OOM on 140 GiB H200s.
+    # At 2048: 32 × 2048² × 2 = ~268 MiB/sample, ~2 GiB for batch 8.
+    redpajama_seq_len = 2048
+
     def tokenize_fn(examples):
         # RedPajama sample has 'text' field
         return tokenizer(
             examples["text"],
             truncation=True,
-            max_length=config.max_seq_len,
+            max_length=redpajama_seq_len,
             padding=False,
         )
 

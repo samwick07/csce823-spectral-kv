@@ -172,14 +172,17 @@ def train_longalpaca(
     try:
         _ds = json.loads(Path(ds_config_path).read_text())
         grad_accum = int(_ds.get("gradient_accumulation_steps", 1))
+        # Use the micro batch size from the DS config (longctx uses 2, not 8)
+        micro_bs = int(_ds.get("train_micro_batch_size_per_gpu", config.batch_size_per_gpu))
     except (OSError, ValueError) as e:
         logger.warning(f"Could not read DeepSpeed config for accumulation: {e}; assuming 1")
         grad_accum = 1
+        micro_bs = config.batch_size_per_gpu
 
     training_args = TrainingArguments(
         output_dir=f"{output_dir}/{config.config_id}/phase2_longalpaca",
         num_train_epochs=config.longalpaca_epochs,
-        per_device_train_batch_size=config.batch_size_per_gpu,
+        per_device_train_batch_size=micro_bs,
         gradient_accumulation_steps=grad_accum,
         learning_rate=config.learning_rate,
         warmup_steps=config.warmup_steps,
