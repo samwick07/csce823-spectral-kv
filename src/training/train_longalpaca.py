@@ -64,14 +64,19 @@ def train_longalpaca(
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. Load base model with eager attention.
-    #    Spectral forward overrides LlamaAttention.forward entirely with
-    #    manual attention, so FA2 is never used for compressed computation.
+    # 2. Load model with SDPA attention.
+    #    For baseline (C00): SDPA uses PyTorch's fused flash backend, which is
+    #    O(S*H*D) memory instead of O(S^2*H). At 16K seq len, eager attention
+    #    materializes a [B, 32, 16384, 16384] matrix + fp32 softmax = 48+ GiB;
+    #    SDPA's flash kernel never materializes it, using ~2 GiB instead.
+    #    For compressed configs (C01-C12): the spectral forward overrides
+    #    attention entirely, so this setting is irrelevant — _compute_attention
+    #    has its own FA2 → SDPA → manual fallback chain.
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         token=hf_token,
         torch_dtype=torch.bfloat16,
-        attn_implementation="eager",
+        attn_implementation="sdpa",
         device_map=None,  # DeepSpeed launcher owns device placement
     )
 
