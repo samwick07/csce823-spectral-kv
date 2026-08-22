@@ -160,6 +160,11 @@ print('Model cached at ~/.cache/huggingface/')
 # --- Download datasets ---
 header "DOWNLOADING DATASETS"
 
+# Each dataset is downloaded independently — a failure on one
+# (rename, deprecation, access issue) should not block the others.
+# The training/eval code will surface a clear error at runtime if a
+# dataset is truly unavailable.
+
 python -c "
 from datasets import load_dataset
 
@@ -171,22 +176,27 @@ datasets = [
 ]
 
 for name, split, kwargs in datasets:
-    print(f'Downloading: {name} [{split}]')
-    ds = load_dataset(name, split=split, **kwargs)
-    print(f'  Rows: {len(ds)}')
+    try:
+        print(f'Downloading: {name} [{split}]')
+        ds = load_dataset(name, split=split, **kwargs)
+        print(f'  Rows: {len(ds)}')
+    except Exception as e:
+        print(f'  WARNING: {name} failed - {e}')
+        print(f'  Continuing. The training/eval code will retry at runtime.')
 "
 
 # LongBench (separate due to different loading)
 echo "Downloading: LongBench V1..."
 python -c "
 from datasets import load_dataset
+# NOTE: org is THUDM (not THUIAR) — matches src/eval/longbench.py
 tasks = ['narrativeqa', 'qasper', 'multifieldqa_en', 'hotpotqa', '2wikimqa', 'musique', 'gov_report', 'qmsum', 'multi_news', 'trec', 'triviaqa', 'samsum', 'passage_count', 'passage_retrieval_en']
 for task in tasks:
     try:
-        ds = load_dataset('THUIAR/LongBench', task, split='test', trust_remote_code=True)
+        ds = load_dataset('THUDM/LongBench', task, split='test', trust_remote_code=True)
         print(f'  {task}: {len(ds)} rows')
     except Exception as e:
-        print(f'  {task}: FAILED - {e}')
+        print(f'  {task}: WARNING - {e}')
 "
 
 echo -e "${GREEN}Datasets cached at ~/.cache/huggingface/${NC}"

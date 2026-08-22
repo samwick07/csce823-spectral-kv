@@ -107,10 +107,24 @@ def train_redpajama(
 
     # 6. Load and tokenize RedPajama
     logger.info("Loading RedPajama dataset")
-    dataset = load_dataset(
+    # Try the original name first; HF has been known to rename/move datasets.
+    rp_names = [
         "togethercomputer/RedPajama-Data-1T-Sample",
-        split="train",
-    )
+        "ontocord/RedPajama-Data-1T-Sample",
+    ]
+    dataset = None
+    for ds_name in rp_names:
+        try:
+            dataset = load_dataset(ds_name, split="train")
+            logger.info(f"Loaded RedPajama from {ds_name}: {len(dataset)} rows")
+            break
+        except Exception as e:
+            logger.warning(f"Could not load {ds_name}: {e}")
+    if dataset is None:
+        raise RuntimeError(
+            "Could not load RedPajama dataset from any known name. "
+            f"Tried: {rp_names}"
+        )
 
     def tokenize_fn(examples):
         # RedPajama sample has 'text' field
