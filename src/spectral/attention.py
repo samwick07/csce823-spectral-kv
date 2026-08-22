@@ -92,7 +92,7 @@ def _compute_attention(
             output = flash_attn_func(q_fa2, k_fa2, v_fa2, causal=True)
             return output.transpose(1, 2)  # back to [B, H, S_q, D]
         except Exception as e:
-            logger.debug_once(f"flash_attn_func failed ({e}), falling back")
+            logger.debug(f"flash_attn_func failed ({e}), falling back")
 
     # Path 2: PyTorch SDPA (almost as fast, no external dep)
     if use_flash and _HAS_SDPA:
@@ -107,7 +107,7 @@ def _compute_attention(
             )
             return output
         except Exception as e:
-            logger.debug_once(f"SDPA failed ({e}), falling back to manual")
+            logger.debug(f"SDPA failed ({e}), falling back to manual")
 
     # Path 3: Manual attention (original implementation, always works)
     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)

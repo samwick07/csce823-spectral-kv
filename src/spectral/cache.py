@@ -127,6 +127,7 @@ class SpectralKVCache(nn.Module):
         self.config = config
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self._orig_dtype = torch.float32  # updated on compress()
 
         if config.is_baseline:
             # Baseline: no spectral processing
@@ -188,6 +189,9 @@ class SpectralKVCache(nn.Module):
             value_states: [B, num_kv_heads, S, head_dim]
         """
         seq_len = key_states.shape[-2]
+
+        # Track original dtype for reconstruction (FFT forces float32)
+        self._orig_dtype = key_states.dtype
 
         if self._is_spectral:
             # Transform to spectral domain
@@ -305,6 +309,11 @@ class SpectralKVCache(nn.Module):
         if self._is_spectral:
             k_spatial = self.transform.inverse(self._cached_k_spectral, target_len)
             v_spatial = self.transform.inverse(self._cached_v_spectral, target_len)
+            # Cast back to original dtype (FFT inverse returns float32)
+            orig_dtype = getattr(self, "_orig_dtype", None)
+            if orig_dtype is not None and orig_dtype != torch.float32:
+                k_spatial = k_spatial.to(orig_dtype)
+                v_spatial = v_spatial.to(orig_dtype)
         else:
             # Baseline: already spatial
             k_spatial = self._cached_k_spectral
