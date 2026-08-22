@@ -114,14 +114,50 @@ header "INSTALLING DEPENDENCIES"
 
 pip install -r requirements.txt
 
-# flash-attn needs --no-build-isolation (it uses the installed torch's
-# CUDA headers). If the build fails (toolchain mismatch), remove it and
-# continue -- the code falls back to PyTorch SDPA automatically.
-pip install flash-attn>=2.5 --no-build-isolation || {
-    echo -e "${YELLOW}flash-attn build failed. Removing from venv.${NC}"
-    echo -e "${YELLOW}The code will fall back to PyTorch SDPA (Fix 2, Path 2).${NC}"
-    pip uninstall flash-attn -y 2>/dev/null || true
-}
+# flash-attn: try pre-built wheel first (no nvcc needed), then build
+# from source (needs CUDA toolkit), then fall back to PyTorch SDPA.
+#
+# The Coder workspace doesn't have nvcc, so building from source fails.
+# But Dao-AILab publishes pre-built wheels for common torch/cuda/python
+# combos. We match by: cu13 + cp312 + x86_64 + CXX11_ABI=True.
+FLASH_ATTN_OK=false
+
+# Step 1: Try pre-built wheel from GitHub releases
+TORCH_VER=$(python -c "import torch; print(torch.__version__.split('+')[0])")
+CUDA_VER=$(python -c "import torch; print(torch.version.cuda.split('.')[0])" 2>/dev/null || echo "")
+PY_VER=$(python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
+ABI=$(python -c "import torch; print('TRUE' if torch._C._GLIBCXX_USE_CXX11_ABI else 'FALSE')")
+
+if [[ -n "$CUDA_VER" ]]; then
+    WHEEL_NAME="flash_attn-2.8.3+cu${CUDA_VER}torch2.9cxx11abi${ABI}-${PY_VER}-${PY_VER}-linux_x86_64.whl"
+    WHEEL_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/${WHEEL_NAME}"
+    echo -e "${YELLOW}Attempting pre-built flash-attn wheel: ${WHEEL_NAME}${NC}"
+    if pip install "${WHEEL_URL}" 2>/dev/null; then
+        echo -e "${GREEN}flash-attn installed from pre-built wheel.${NC}"
+        FLASH_ATTN_OK=true
+    else
+        echo -e "${YELLOW}Pre-built wheel failed. Trying build from source...${NC}"
+    fi
+fi
+
+# Step 2: Try building from source (needs nvcc)
+if [[ "$FLASH_ATTN_OK" == "false" ]]; then
+    # Install CUDA toolkit if nvcc is missing
+    if ! command -v nvcc &>/dev/null; then
+        echo -e "${YELLOW}nvcc not found. Installing CUDA toolkit via apt...${NC}"
+        sudo apt-get update -qq && sudo apt-get install -y nvidia-cuda-toolkit 2>/dev/null || true
+        # Set CUDA_HOME if we can find it
+        export CUDA_HOME=${CUDA_HOME:-/usr}
+    fi
+    if pip install flash-attn>=2.5 --no-build-isolation 2>/dev/null; then
+        echo -e "${GREEN}flash-attn built from source.${NC}"
+        FLASH_ATTN_OK=true
+    else
+        echo -e "${YELLOW}flash-attn build failed. Removing from venv.${NC}"
+        echo -e "${YELLOW}The code will fall back to PyTorch SDPA (Fix 2, Path 2).${NC}"
+        pip uninstall flash-attn -y 2>/dev/null || true
+    fi
+fi
 
 echo -e "${GREEN}Dependencies installed.${NC}"
 
