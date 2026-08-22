@@ -89,7 +89,12 @@ def train_longalpaca(
     # 4. Load Phase 1 LoRA adapters
     #    The spectral_cache module is saved by modules_to_save, so it
     #    will be loaded from the Phase 1 checkpoint.
-    model = PeftModel.from_pretrained(model, phase1_checkpoint)
+    #    is_trainable=True is critical: PeftModel.from_pretrained defaults to
+    #    is_trainable=False (inference mode), which freezes all adapter
+    #    parameters. DeepSpeed then gets an empty parameter list and crashes
+    #    with "optimizer got an empty parameter list".
+    model = PeftModel.from_pretrained(model, phase1_checkpoint, is_trainable=True)
+    model.print_trainable_parameters()
     logger.info(f"Loaded Phase 1 LoRA adapters from {phase1_checkpoint}")
 
     # PEFT + gradient checkpointing: preserve backward chain through frozen
