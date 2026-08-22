@@ -171,7 +171,11 @@ def apply_spectral_compression(
         spectral_cache = SpectralKVCache(config, num_kv_heads, head_dim)
 
         # Register the cache as a submodule so its parameters are tracked
+        # and moved to the correct device along with the model.
         attn.add_module("spectral_cache", spectral_cache)
+        # Move spectral cache parameters (learnable filter logits, etc.)
+        # to the same device as the attention layer.
+        spectral_cache = spectral_cache.to(next(attn.parameters()).device)
 
         # Store original forward and wrap it
         original_forward = attn.forward
