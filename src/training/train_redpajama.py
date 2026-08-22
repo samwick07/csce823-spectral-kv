@@ -107,23 +107,35 @@ def train_redpajama(
 
     # 6. Load and tokenize RedPajama
     logger.info("Loading RedPajama dataset")
-    # Try the original name first; HF has been known to rename/move datasets.
-    rp_names = [
-        "togethercomputer/RedPajama-Data-1T-Sample",
-        "ontocord/RedPajama-Data-1T-Sample",
+    # RedPajama-Data-1T-Sample was removed from HF. Use the full 1T
+    # dataset with streaming + take(n) to get only the samples we need
+    # (1000 steps * batch_size 64 = 64K samples, pull 80K for safety).
+    rp_datasets = [
+        # Original sample (removed, but try in case it returns)
+        ("togethercomputer/RedPajama-Data-1T-Sample", {"split": "train"}),
+        # Full dataset via streaming — pull only what we need
+        ("togethercomputer/RedPajama-Data-1T", {"split": "train", "streaming": True}),
     ]
+    rp_streaming = False
     dataset = None
-    for ds_name in rp_names:
+    for ds_name, ds_kwargs in rp_datasets:
         try:
-            dataset = load_dataset(ds_name, split="train")
-            logger.info(f"Loaded RedPajama from {ds_name}: {len(dataset)} rows")
+            dataset = load_dataset(ds_name, **ds_kwargs)
+            if ds_kwargs.get("streaming"):
+                rp_streaming = True
+                # Take 80K samples from the stream (64K needed + margin)
+                from itertools import islice
+                dataset = list(islice(dataset, 80000))
+                logger.info(f"Loaded {len(dataset)} samples from {ds_name} (streaming)")
+            else:
+                logger.info(f"Loaded RedPajama from {ds_name}: {len(dataset)} rows")
             break
         except Exception as e:
             logger.warning(f"Could not load {ds_name}: {e}")
     if dataset is None:
         raise RuntimeError(
-            "Could not load RedPajama dataset from any known name. "
-            f"Tried: {rp_names}"
+            "Could not load RedPajama dataset. Tried: "
+            + ", ".join(d[0] for d in rp_datasets)
         )
 
     def tokenize_fn(examples):

@@ -168,8 +168,11 @@ header "DOWNLOADING DATASETS"
 python -c "
 from datasets import load_dataset
 
+# RedPajama-Data-1T-Sample was removed from HF. The full 1T dataset
+# is streamed at training time (only 80K samples pulled). Skip pre-caching.
+# Yukang/LongAlpaca-16k, pg19, and proof-pile are small enough to pre-cache.
+
 datasets = [
-    ('togethercomputer/RedPajama-Data-1T-Sample', 'train', {}),
     ('Yukang/LongAlpaca-16k', 'train', {}),
     ('deepmind/pg19', 'test', {}),
     ('EleutherAI/proof-pile', 'test', {'trust_remote_code': True}),
@@ -183,6 +186,16 @@ for name, split, kwargs in datasets:
     except Exception as e:
         print(f'  WARNING: {name} failed - {e}')
         print(f'  Continuing. The training/eval code will retry at runtime.')
+
+# Verify RedPajama-Data-1T is accessible (streaming, just check first sample)
+print('Verifying: togethercomputer/RedPajama-Data-1T (streaming, first sample only)')
+try:
+    ds = load_dataset('togethercomputer/RedPajama-Data-1T', split='train', streaming=True)
+    first = next(iter(ds))
+    print(f'  OK - first sample keys: {list(first.keys())}')
+except Exception as e:
+    print(f'  WARNING: {e}')
+    print(f'  Training will fail if this cannot be resolved.')
 "
 
 # LongBench (separate due to different loading)
