@@ -192,6 +192,30 @@ if [[ -z "${HF_TOKEN:-}" ]]; then
     echo -e "${YELLOW}for gated models. Set it with: export HF_TOKEN=hf_your_token${NC}"
 fi
 
+# --- Restore HF cache from PVC backup ---
+# The HF cache (~55GB: Llama-3.1-8B-Instruct + dataset caches) lives under
+# $HOME/.cache, which is the ephemeral container overlay — wiped on every
+# workspace stop/start. /workspaces is a persistent PVC, so a backup of the
+# cache there survives restarts. If the cache is gone but a backup exists,
+# restore it to avoid a ~16GB gated-model re-download.
+HF_CACHE_DIR="$HOME/.cache/huggingface"
+HF_BACKUP_DIR="/workspaces/hf-cache-backup"
+MODEL_MARKER="$HF_CACHE_DIR/hub/models--meta-llama--Llama-3.1-8B-Instruct"
+BACKUP_MARKER="$HF_BACKUP_DIR/hub/models--meta-llama--Llama-3.1-8B-Instruct"
+if [[ "${1:-}" == "--backup-cache" ]]; then
+    # Refresh the backup (e.g. after a run added dataset caches).
+    mkdir -p "$HF_BACKUP_DIR"
+    cp -a "$HF_CACHE_DIR/." "$HF_BACKUP_DIR/"
+    echo -e "${GREEN}HF cache backed up to $HF_BACKUP_DIR: $(du -sh "$HF_BACKUP_DIR" | cut -f1)${NC}"
+    exit 0
+fi
+if [[ ! -d "$MODEL_MARKER" && -d "$BACKUP_MARKER" ]]; then
+    echo -e "${YELLOW}HF cache missing (workspace restart?). Restoring from $HF_BACKUP_DIR...${NC}"
+    mkdir -p "$HF_CACHE_DIR"
+    cp -a "$HF_BACKUP_DIR/." "$HF_CACHE_DIR/"
+    echo -e "${GREEN}HF cache restored: $(du -sh "$HF_CACHE_DIR" | cut -f1)${NC}"
+fi
+
 # --- Pass through remaining args to orchestrator ---
 ORCH_ARGS=("$@")
 
