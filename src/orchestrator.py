@@ -279,15 +279,29 @@ def train_config(config_id: str, hf_token: str | None) -> bool:
     # train_batch_size consistent (global = micro_bs x num_gpus x accum = 64).
     ds_config = _select_deepspeed_config(config_file, num_gpus)
 
-    # Build the training command
-    cmd = [
-        sys.executable, "-m", "deepspeed",
-        f"--num_gpus={num_gpus}",
-        "src/run_experiment.py",
-        "--config", str(config_file),
-        "--mode", "train",
-        "--deepspeed-config", ds_config,
-    ]
+    # Build the training command.
+    # DeepSpeed 0.19+ removed __main__, so use the CLI binary directly.
+    # Fall back to -m deepspeed for older versions.
+    import shutil
+    ds_launcher = shutil.which("deepspeed")
+    if ds_launcher:
+        cmd = [
+            ds_launcher,
+            f"--num_gpus={num_gpus}",
+            "src/run_experiment.py",
+            "--config", str(config_file),
+            "--mode", "train",
+            "--deepspeed-config", ds_config,
+        ]
+    else:
+        cmd = [
+            sys.executable, "-m", "deepspeed",
+            f"--num_gpus={num_gpus}",
+            "src/run_experiment.py",
+            "--config", str(config_file),
+            "--mode", "train",
+            "--deepspeed-config", ds_config,
+        ]
     if hf_token:
         cmd.extend(["--hf-token", hf_token])
 
