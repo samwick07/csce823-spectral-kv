@@ -2,7 +2,7 @@
 # =============================================================================
 # monitor.sh — Live monitoring dashboard for the spectral KV experiment.
 #
-# Shows: tmux session status, orchestrator state, GPU utilization,
+# Shows: process status, orchestrator state, GPU utilization,
 # checkpoint progress, recent log tail, and disk usage.
 #
 # Usage:
@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-SESSION_NAME="${SESSION_NAME:-spectral-kv}"
+PID_FILE="$PROJECT_ROOT/.orchestrator_pid"
 STATE_FILE="results/orchestrator_state.json"
 
 # Colors
@@ -41,18 +41,27 @@ show_dashboard() {
     echo -e "${CYAN}║  $(date '+%Y-%m-%d %H:%M:%S UTC')                            ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${NC}"
 
-    # --- tmux session ---
+    # --- Process status (nohup PID file) ---
     echo -e "\n${BLUE}── SESSION ──${NC}"
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-        PID=$(tmux list-panes -t "$SESSION_NAME" -F '#{pane_pid}' 2>/dev/null | head -1)
-        echo -e "  Status: ${GREEN}RUNNING${NC} (tmux: $SESSION_NAME, PID: ${PID:-unknown})"
-        echo -e "  Attach: bash scripts/run.sh --attach"
-    elif [[ -f .orchestrator_pid ]]; then
-        PID=$(cat .orchestrator_pid)
+    if [[ -f "$PID_FILE" ]]; then
+        PID=$(cat "$PID_FILE")
         if kill -0 "$PID" 2>/dev/null; then
-            echo -e "  Status: ${GREEN}RUNNING${NC} (nohup, PID: $PID)"
+            # Get process runtime
+            if [[ -f /proc/$PID/stat ]]; then
+                STARTTIME=$(stat -c %Y /proc/$PID/stat 2>/dev/null || echo 0)
+                NOW=$(date +%s)
+                UPTIME_SEC=$((NOW - STARTTIME))
+                UPTIME_HR=$((UPTIME_SEC / 3600))
+                UPTIME_MIN=$(((UPTIME_SEC % 3600) / 60))
+                echo -e "  Status: ${GREEN}RUNNING${NC} (PID: $PID, uptime: ${UPTIME_HR}h ${UPTIME_MIN}m)"
+            else
+                echo -e "  Status: ${GREEN}RUNNING${NC} (PID: $PID)"
+            fi
+            echo -e "  Log:    bash scripts/run.sh --log"
+            echo -e "  Stop:   bash scripts/run.sh --stop"
         else
-            echo -e "  Status: ${YELLOW}STOPPED${NC} (nohup PID $PID no longer alive)"
+            echo -e "  Status: ${YELLOW}STOPPED${NC} (PID $PID no longer alive)"
+            echo -e "  Start:  bash scripts/run.sh"
         fi
     else
         echo -e "  Status: ${YELLOW}NOT RUNNING${NC}"
@@ -161,11 +170,23 @@ print(f'  Progress: [{bar}] {pct:.1f}%')
 
     # --- Recent log ---
     echo -e "\n${BLUE}── RECENT LOG (last 15 lines) ──${NC}"
-    LATEST_LOG=$(ls -t logs/orchestrator_*.log 2>/dev/null | head -1)
-    if [[ -n "$LATEST_LOG" ]]; then
+    # Prefer the latest.log symlink (nohup stdout+stderr), then fall back
+    # to the newest run_*.log, then the orchestrator's own log.
+    LATEST_LOG=""
+    if [[ -L "logs/latest.log" ]]; then
+        LATEST_LOG=$(readlink -f "logs/latest.log" 2>/dev/null)
+    fi
+    if [[ -z "$LATEST_LOG" || ! -f "$LATEST_LOG" ]]; then
+        LATEST_LOG=$(ls -t logs/run_*.log 2>/dev/null | head -1)
+    fi
+    if [[ -z "$LATEST_LOG" || ! -f "$LATEST_LOG" ]]; then
+        LATEST_LOG=$(ls -t logs/orchestrator_*.log 2>/dev/null | head -1)
+    fi
+    if [[ -n "$LATEST_LOG" && -f "$LATEST_LOG" ]]; then
+        echo "  ($LATEST_LOG)"
         tail -15 "$LATEST_LOG" 2>/dev/null | sed 's/^/  /'
     else
-        echo "  (no orchestrator logs found)"
+        echo "  (no log files found)"
     fi
 
     echo ""
@@ -173,6 +194,7 @@ print(f'  Progress: [{bar}] {pct:.1f}%')
         echo -e "${CYAN}Refreshing in ${REFRESH}s... (Ctrl+C to exit)${NC}"
     else
         echo "Live mode: bash scripts/monitor.sh --watch"
+        echo "Log tail:  bash scripts/run.sh --log"
     fi
 }
 

@@ -2,12 +2,9 @@
 # =============================================================================
 # run.sh — Single entry point for the spectral KV-cache experiment.
 #
-# This script is designed for resilience:
-#   - Launches the orchestrator inside a tmux session that survives
-#     SSH disconnects and VPN drops.
-#   - Uses nohup as a fallback if tmux is not available.
-#   - The orchestrator itself auto-detects completed work and resumes
-#     from the last checkpoint after crashes or power outages.
+# Launches the orchestrator with nohup + setsid, logging all stdout/stderr
+# to a timestamped log file. Survives SSH disconnects and workspace agent
+# restarts. No tmux dependency.
 #
 # Usage:
 #   bash scripts/run.sh                  # full experiment (13 configs x num_seeds from YAML)
@@ -17,14 +14,13 @@
 #   bash scripts/run.sh --phase eval     # eval only
 #   bash scripts/run.sh --phase analyze  # statistical analysis only
 #   bash scripts/run.sh --config C01     # single config
-#   bash scripts/run.sh --status         # print current progress
-#   bash scripts/run.sh --attach         # attach to running tmux session
+#   bash scripts/run.sh --status         # print current progress + process status
 #   bash scripts/run.sh --stop           # gracefully stop the experiment
+#   bash scripts/run.sh --log            # tail the latest log file (Ctrl+C to exit)
 #
 # Environment variables:
 #   HF_TOKEN       — HuggingFace access token (required for model download)
 #   WANDB_API_KEY  — Weights & Biases API key (optional, for experiment tracking)
-#   SESSION_NAME   — tmux session name (default: spectral-kv)
 # =============================================================================
 
 set -euo pipefail
@@ -33,9 +29,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-SESSION_NAME="${SESSION_NAME:-spectral-kv}"
 VENV_DIR="$PROJECT_ROOT/.venv"
 LOG_DIR="$PROJECT_ROOT/logs"
+PID_FILE="$PROJECT_ROOT/.orchestrator_pid"
 mkdir -p "$LOG_DIR"
 
 TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
@@ -81,33 +77,88 @@ print(f\"  Crash count: {s.get('crash_count', 0)}\")
             echo "  No state file found. Experiment has not been run yet."
         fi
     fi
-    exit 0
-fi
-
-# --- Attach mode ---
-if [[ "${1:-}" == "--attach" ]]; then
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-        exec tmux attach -t "$SESSION_NAME"
+    # Show process status
+    echo ""
+    if [[ -f "$PID_FILE" ]]; then
+        PID=$(cat "$PID_FILE")
+        if kill -0 "$PID" 2>/dev/null; then
+            echo -e "  Process: ${GREEN}RUNNING${NC} (PID: $PID)"
+        else
+            echo -e "  Process: ${YELLOW}STOPPED${NC} (PID $PID no longer alive)"
+        fi
     else
-        echo -e "${YELLOW}No tmux session '$SESSION_NAME' found.${NC}"
-        echo "Is the experiment running? Check: bash scripts/run.sh --status"
-        exit 1
+        echo -e "  Process: ${YELLOW}NOT RUNNING${NC}"
     fi
+    exit 0
 fi
 
 # --- Stop mode ---
 if [[ "${1:-}" == "--stop" ]]; then
     print_header "STOPPING EXPERIMENT"
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-        # Send Ctrl+C (SIGINT) for graceful shutdown
-        tmux send-keys -t "$SESSION_NAME" C-c
-        echo -e "${YELLOW}Sent SIGINT to tmux session. The orchestrator will"
-        echo -e "finish the current subprocess and then stop.${NC}"
-        echo "Attach to watch: bash scripts/run.sh --attach"
+    if [[ -f "$PID_FILE" ]]; then
+        PID=$(cat "$PID_FILE")
+        if kill -0 "$PID" 2>/dev/null; then
+            # Send SIGTERM to the process group (negative PID = whole group).
+            # setsid at launch time made the orchestrator a group leader, so
+            # this kills Python + any DeepSpeed subprocesses in one shot.
+            kill -TERM "-$PID" 2>/dev/null || kill -TERM "$PID" 2>/dev/null
+            echo -e "${YELLOW}Sent SIGTERM to process group $PID.${NC}"
+            echo -e "${YELLOW}The orchestrator will finish the current subprocess and then stop.${NC}"
+            # Wait up to 15 seconds for graceful shutdown
+            for i in $(seq 1 15); do
+                kill -0 "$PID" 2>/dev/null || break
+                sleep 1
+            done
+            if kill -0 "$PID" 2>/dev/null; then
+                echo -e "${RED}Process did not exit after 15s, sending SIGKILL.${NC}"
+                kill -KILL "-$PID" 2>/dev/null || kill -KILL "$PID" 2>/dev/null
+            else
+                echo -e "${GREEN}Process exited cleanly.${NC}"
+            fi
+            rm -f "$PID_FILE"
+        else
+            echo -e "${YELLOW}PID $PID is not running. Cleaning up PID file.${NC}"
+            rm -f "$PID_FILE"
+        fi
     else
-        echo -e "${YELLOW}No tmux session found. Experiment may not be running.${NC}"
+        echo -e "${YELLOW}No PID file found. Experiment may not be running.${NC}"
+        echo "Check for orphaned processes: pgrep -f 'src.orchestrator'"
     fi
     exit 0
+fi
+
+# --- Log mode (replaces --attach) ---
+if [[ "${1:-}" == "--log" ]]; then
+    LATEST_LOG="$LOG_DIR/latest.log"
+    if [[ -L "$LATEST_LOG" ]]; then
+        LATEST_LOG=$(readlink -f "$LATEST_LOG")
+    elif [[ ! -f "$LATEST_LOG" ]]; then
+        LATEST_LOG=$(ls -t "$LOG_DIR"/run_*.log 2>/dev/null | head -1)
+    fi
+    if [[ -n "$LATEST_LOG" && -f "$LATEST_LOG" ]]; then
+        echo "Tailing $LATEST_LOG (Ctrl+C to exit)"
+        echo ""
+        tail -f "$LATEST_LOG"
+    else
+        echo "No log files found in $LOG_DIR"
+        exit 1
+    fi
+    exit 0
+fi
+
+# --- Check if already running ---
+if [[ -f "$PID_FILE" ]]; then
+    PID=$(cat "$PID_FILE")
+    if kill -0 "$PID" 2>/dev/null; then
+        echo -e "${YELLOW}Experiment already running (PID: $PID).${NC}"
+        echo "  Stop:    bash scripts/run.sh --stop"
+        echo "  Status:  bash scripts/run.sh --status"
+        echo "  Log:     bash scripts/run.sh --log"
+        exit 1
+    else
+        echo -e "${YELLOW}Stale PID file found (PID $PID not running). Removing.${NC}"
+        rm -f "$PID_FILE"
+    fi
 fi
 
 # --- Check venv ---
@@ -157,54 +208,30 @@ COMMAND+="python -m src.orchestrator ${ORCH_ARGS[*]:-}"
 
 LOG_FILE="$LOG_DIR/run_${TIMESTAMP}.log"
 
-# --- Launch in tmux (preferred) or nohup (fallback) ---
-if command -v tmux &>/dev/null; then
-    if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-        echo -e "${YELLOW}Session '$SESSION_NAME' already exists.${NC}"
-        echo -e "Attach with: bash scripts/run.sh --attach"
-        echo -e "Or stop it first: bash scripts/run.sh --stop"
-        exit 1
-    fi
+# --- Launch with nohup + setsid ---
+# setsid creates a new session/process group so --stop can kill the
+# entire tree (Python + DeepSpeed subprocesses) with a single
+# `kill -- -$PID`. nohup ignores SIGHUP so the process survives
+# SSH/VPN disconnects and workspace agent restarts.
+print_header "LAUNCHING EXPERIMENT"
+echo "  Log file: $LOG_FILE"
+echo "  PID file: $PID_FILE"
+echo "  Command:  python -m src.orchestrator ${ORCH_ARGS[*]:-}"
+echo ""
+echo -e "${GREEN}The experiment will continue running even if your SSH/VPN${NC}"
+echo -e "${GREEN}connection drops. To monitor:${NC}"
+echo "    bash scripts/run.sh --status    # print progress + process status"
+echo "    bash scripts/run.sh --log       # tail the latest log (Ctrl+C to exit)"
+echo "    bash scripts/monitor.sh         # one-shot dashboard"
+echo "    tail -f $LOG_FILE             # raw log tail"
 
-    print_header "LAUNCHING IN TMUX"
-    echo "  Session:  $SESSION_NAME"
-    echo "  Log file: $LOG_FILE"
-    echo "  Command:  python -m src.orchestrator ${ORCH_ARGS[*]:-}"
-    echo ""
-    echo -e "${GREEN}The experiment will continue running even if your SSH/VPN${NC}"
-    echo -e "${GREEN}connection drops. To monitor:${NC}"
-    echo "    bash scripts/run.sh --attach    # attach to tmux session"
-    echo "    bash scripts/run.sh --status    # print progress summary"
-    echo "    bash scripts/monitor.sh         # live monitoring"
-    echo "    tail -f $LOG_FILE             # raw log"
+setsid nohup bash -c "cd $PROJECT_ROOT && $COMMAND" > "$LOG_FILE" 2>&1 &
+PID=$!
+echo "$PID" > "$PID_FILE"
 
-    tmux new-session -d -s "$SESSION_NAME" -x 200 -y 50 \
-        "cd $PROJECT_ROOT && $COMMAND 2>&1 | tee $LOG_FILE; echo ''; echo 'Press Enter to close'; read"
+# Convenience symlink so --log and monitor.sh always find the latest
+ln -sf "$LOG_FILE" "$LOG_DIR/latest.log"
 
-    echo -e "\n${GREEN}Started. Attaching to session...${NC}"
-    echo "(Press Ctrl+B then D to detach without stopping)"
-    sleep 1
-    exec tmux attach -t "$SESSION_NAME"
-
-elif command -v nohup &>/dev/null; then
-    print_header "LAUNCHING WITH NOHUP"
-    echo "  Log file: $LOG_FILE"
-    echo ""
-    echo -e "${YELLOW}tmux not found. Using nohup (no attach capability).${NC}"
-
-    nohup bash -c "cd $PROJECT_ROOT && $COMMAND" > "$LOG_FILE" 2>&1 &
-    PID=$!
-    echo "$PID" > "$PROJECT_ROOT/.orchestrator_pid"
-    echo -e "${GREEN}Started with PID $PID${NC}"
-    echo "Monitor with:"
-    echo "    bash scripts/run.sh --status"
-    echo "    tail -f $LOG_FILE"
-    echo "    kill $PID  # to stop"
-
-else
-    echo -e "${RED}Neither tmux nor nohup found. Cannot run in background.${NC}"
-    echo "Run directly:"
-    echo "    source $VENV_DIR/bin/activate"
-    echo "    python -m src.orchestrator $*"
-    exit 1
-fi
+echo -e "\n${GREEN}Started with PID $PID${NC}"
+echo "  Stop:  bash scripts/run.sh --stop"
+echo "  Log:   bash scripts/run.sh --log"
