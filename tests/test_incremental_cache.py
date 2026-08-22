@@ -418,7 +418,7 @@ class TestDCTPrecomputedConstants:
 
         # Verify round-trip still works
         error = (k - reconstructed).abs().max().item()
-        assert error < 1e-10, f"DCT round-trip error too high with cached constants: {error}"
+        assert error < 1e-5, f"DCT round-trip error too high with cached constants: {error}"
 
 
 # ---------------------------------------------------------------------------

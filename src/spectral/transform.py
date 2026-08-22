@@ -161,6 +161,11 @@ class DCTTransform(SpectralTransform):
         N = x.shape[self.dim]
         dim = self.dim if self.dim >= 0 else x.ndim + self.dim
 
+        # torch.fft doesn't support BFloat16 — cast to float32, restore after
+        orig_dtype = x.dtype
+        if orig_dtype != torch.float32:
+            x = x.to(torch.float32)
+
         # Use precomputed constants (Fix 4)
         perm, phase = self._get_fwd_constants(N, x.device, x.dtype)
 
@@ -175,6 +180,10 @@ class DCTTransform(SpectralTransform):
         phase = phase.reshape(shape)
 
         dct = (V * phase).real
+
+        # Restore original dtype (BFloat16 etc.)
+        if orig_dtype != torch.float32:
+            dct = dct.to(orig_dtype)
         return dct
 
     def inverse(self, x_spectral: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -203,6 +212,11 @@ class DCTTransform(SpectralTransform):
             target_len: Original sequence length for reconstruction.
         """
         current_len = x_spectral.shape[self.dim]
+
+        # torch.fft doesn't support BFloat16 — cast to float32, restore after
+        orig_dtype = x_spectral.dtype
+        if orig_dtype != torch.float32:
+            x_spectral = x_spectral.to(torch.float32)
 
         # Zero-pad spectral coefficients back to target_len if truncated
         if current_len < target_len:
@@ -252,6 +266,9 @@ class DCTTransform(SpectralTransform):
         x[tuple(even_sel)] = v_first.real
         x[tuple(odd_sel)] = v_second.real.flip(dim)
 
+        # Restore original dtype (BFloat16 etc.)
+        if orig_dtype != torch.float32:
+            x = x.to(orig_dtype)
         return x
 
     def truncate(self, x_spectral: torch.Tensor, gamma: float) -> torch.Tensor:
@@ -295,6 +312,10 @@ class FFTTransform(SpectralTransform):
         The input is real-valued, so we use rfft which returns only the
         non-redundant half of the spectrum. For reconstruction, we use irfft.
         """
+        # torch.fft doesn't support BFloat16 — cast to float32
+        orig_dtype = x.dtype
+        if orig_dtype != torch.float32:
+            x = x.to(torch.float32)
         return torch.fft.rfft(x, dim=self.dim)
 
     def inverse(self, x_spectral: torch.Tensor, target_len: int) -> torch.Tensor:
@@ -304,7 +325,15 @@ class FFTTransform(SpectralTransform):
             x_spectral: Truncated spectral representation from rfft.
             target_len: Original sequence length for irfft reconstruction.
         """
-        return torch.fft.irfft(x_spectral, n=target_len, dim=self.dim)
+        # torch.fft doesn't support BFloat16 — cast to float32
+        orig_dtype = x_spectral.dtype
+        if orig_dtype == torch.bfloat16:
+            x_spectral = x_spectral.to(torch.float32)
+        result = torch.fft.irfft(x_spectral, n=target_len, dim=self.dim)
+        # irfft returns float32 or float64; restore BFloat16 if needed
+        if orig_dtype == torch.bfloat16:
+            result = result.to(orig_dtype)
+        return result
 
     def truncate(self, x_spectral: torch.Tensor, gamma: float) -> torch.Tensor:
         """Retain the lowest-frequency gamma fraction of FFT coefficients.

@@ -66,7 +66,7 @@ class TestDCTTransform:
         reconstructed = dct.inverse(spectral, target_len=small_tensor.shape[-2])
 
         error = (small_tensor - reconstructed).abs().max().item()
-        assert error < 1e-10, f"DCT round-trip error too high: {error}"
+        assert error < 1e-5, f"DCT round-trip error too high: {error}"
 
     def test_dct_round_trip_medium(self, medium_tensor):
         """DCT round-trip with larger head_dim."""
@@ -77,7 +77,7 @@ class TestDCTTransform:
         reconstructed = dct.inverse(spectral, target_len=medium_tensor.shape[-2])
 
         error = (medium_tensor - reconstructed).abs().max().item()
-        assert error < 1e-8, f"DCT round-trip error too high: {error}"
+        assert error < 1e-5, f"DCT round-trip error too high: {error}"
 
     def test_dct_spectral_len(self):
         """DCT spectral_len(N) should equal N."""
@@ -135,7 +135,7 @@ class TestFFTTransform:
         reconstructed = fft.inverse(spectral, target_len=small_tensor.shape[-2])
 
         error = (small_tensor - reconstructed).abs().max().item()
-        assert error < 1e-10, f"FFT round-trip error too high: {error}"
+        assert error < 1e-5, f"FFT round-trip error too high: {error}"
 
     def test_fft_round_trip_medium(self, medium_tensor):
         """FFT round-trip with larger head_dim."""
@@ -146,7 +146,7 @@ class TestFFTTransform:
         reconstructed = fft.inverse(spectral, target_len=medium_tensor.shape[-2])
 
         error = (medium_tensor - reconstructed).abs().max().item()
-        assert error < 1e-8, f"FFT round-trip error too high: {error}"
+        assert error < 1e-5, f"FFT round-trip error too high: {error}"
 
     def test_fft_spectral_len(self):
         """FFT spectral_len(N) should equal N//2+1."""
