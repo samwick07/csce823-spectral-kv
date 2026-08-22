@@ -124,15 +124,26 @@ def train_longalpaca(
         raise RuntimeError(f"Could not load LongAlpaca. Tried: {la_names}")
 
     def format_instruction(examples):
-        """Format LongAlpaca examples as instruction-response pairs."""
+        """Format LongAlpaca examples as instruction-response pairs.
+
+        LongAlpaca-12k/16k columns are: instruction, input, output, file.
+        (The original code referenced 'question'/'answer', which don't exist
+        in this dataset — it raises KeyError: 'question' on the first batch.)
+        The 'input' field is frequently empty/None; when so the Input section
+        is omitted, matching the standard Alpaca convention.
+        """
         texts = []
-        for question, answer in zip(examples["question"], examples["answer"]):
+        for instruction, input_text, output in zip(
+            examples["instruction"], examples["input"], examples["output"]
+        ):
             text = (
                 f"Below is an instruction that describes a task. "
                 f"Write a response that appropriately completes the request.\n\n"
-                f"### Instruction:\n{question}\n\n"
-                f"### Response:\n{answer}"
+                f"### Instruction:\n{instruction}\n\n"
             )
+            if input_text:
+                text += f"### Input:\n{input_text}\n\n"
+            text += f"### Response:\n{output}"
             texts.append(text)
         return {"text": texts}
 
