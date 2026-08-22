@@ -11,10 +11,10 @@
     "reduce_bucket_size": 500000000,
     "contiguous_gradients": true
   },
-  "gradient_accumulation_steps": 8,
+  "gradient_accumulation_steps": 16,
   "gradient_clipping": 1.0,
   "train_batch_size": 64,
-  "train_micro_batch_size_per_gpu": 2,
+  "train_micro_batch_size_per_gpu": 1,
   "steps_per_print": 10,
   "wall_clock_breakdown": false,
   "optimizer": {
