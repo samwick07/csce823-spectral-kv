@@ -98,15 +98,15 @@ if raw_dir.exists():
             if (seed_dir / 'all_results.json').exists():
                 eval_count += 1
 
-# Total evals from the config (13 configs x num_seeds) so the monitor
-# is correct for both the N=1 (class) and N=30 (archive) repos.
+# Total evals: prefer orchestrator state's expected count (correct for
+# --seeds overrides), fall back to YAML default.
 try:
     import yaml
     with open('configs/experiment_C00.yaml') as f:
         _num_seeds = max(1, int((yaml.safe_load(f) or {}).get('num_seeds', 30)))
 except Exception:
     _num_seeds = 30
-total_evals = 13 * _num_seeds
+total_evals = s.get('expected_total_evals', 13 * _num_seeds)
 
 print(f'  Current task:    {current}')
 print(f'  Last update:     {last_update}')

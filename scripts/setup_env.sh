@@ -174,7 +174,7 @@ echo -e "${GREEN}Datasets cached at ~/.cache/huggingface/${NC}"
 header "RUNNING SMOKE TEST"
 
 echo "Running unit tests (no GPU required)..."
-python -m pytest tests/test_spectral_transforms.py -v --tb=short
+python -m pytest tests/test_spectral_transforms.py tests/test_incremental_cache.py -v --tb=short
 echo -e "${GREEN}Unit tests passed.${NC}"
 
 echo ""

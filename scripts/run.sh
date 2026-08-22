@@ -11,6 +11,7 @@
 #
 # Usage:
 #   bash scripts/run.sh                  # full experiment (13 configs x num_seeds from YAML)
+#   bash scripts/run.sh --seeds 0        # N=1 point-estimate run (13 configs x 1 seed)
 #   bash scripts/run.sh --pilot          # pilot (3 configs x 5 seeds)
 #   bash scripts/run.sh --phase train    # training only
 #   bash scripts/run.sh --phase eval     # eval only
@@ -124,6 +125,15 @@ fi
 
 GPU_COUNT=$(nvidia-smi -L 2>/dev/null | wc -l)
 echo -e "${GREEN}GPUs detected: $GPU_COUNT${NC}"
+
+# --- Check disk space (need ~200GB for model + datasets + checkpoints) ---
+AVAILABLE_GB=$(df -BG --output=avail "$PROJECT_ROOT" 2>/dev/null | tail -1 | tr -dc '0-9')
+if [[ -n "$AVAILABLE_GB" && "$AVAILABLE_GB" -lt 200 ]]; then
+    echo -e "${RED}INSUFFICIENT DISK SPACE: ${AVAILABLE_GB}GB available${NC}"
+    echo -e "${RED}Need at least 200GB for model (16GB) + datasets (50GB) + checkpoints (50GB) + cache${NC}"
+    exit 1
+fi
+echo -e "${GREEN}Disk space: ${AVAILABLE_GB:-?}GB available${NC}"
 
 # --- Check HF token ---
 if [[ -z "${HF_TOKEN:-}" ]]; then

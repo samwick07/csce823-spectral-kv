@@ -181,7 +181,7 @@ def get_phase2_checkpoint(config_id: str) -> str | None:
 
 def run_subprocess(
     cmd: list[str],
-    timeout: int = 36000,
+    timeout: int = 86400,
     env: dict[str, str] | None = None,
     log_prefix: str = "",
 ) -> bool:
@@ -192,7 +192,9 @@ def run_subprocess(
 
     Args:
         cmd: Command list to execute.
-        timeout: Maximum seconds to wait.
+        timeout: Maximum seconds to wait (default: 86400 = 24h).
+                 Training a compressed config takes ~8h with FA2;
+                 24h gives ample margin for autonomous execution.
         env: Optional environment overrides (merged with os.environ).
         log_prefix: Prefix for log lines (e.g., "[GPU0] ").
     """
@@ -218,12 +220,25 @@ def run_subprocess(
         return False
 
     # Stream output to logger
-    for line in proc.stdout:  # type: ignore[union-attr]
-        line = line.rstrip()
-        if line:
-            logger.info(f"{log_prefix}  | {line}")
+    try:
+        for line in proc.stdout:  # type: ignore[union-attr]
+            line = line.rstrip()
+            if line:
+                logger.info(f"{log_prefix}  | {line}")
+    except Exception as e:
+        logger.warning(f"{log_prefix}Error while streaming output: {e}")
 
-    proc.wait(timeout=timeout)
+    # Wait for process with timeout — catch TimeoutExpired so it
+    # doesn't crash the orchestrator (critical for autonomous runs).
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.error(
+            f"{log_prefix}Subprocess timed out after {timeout}s. Killing."
+        )
+        proc.kill()
+        proc.wait()
+        return False
 
     if proc.returncode != 0:
         logger.error(f"{log_prefix}Subprocess failed with exit code {proc.returncode}")
@@ -277,19 +292,39 @@ def train_config(config_id: str, hf_token: str | None) -> bool:
         cmd.extend(["--hf-token", hf_token])
 
     logger.info(f"[{config_id}] Starting training on {num_gpus} GPUs (DS: {ds_config})")
-    success = run_subprocess(cmd)
 
-    if success and is_training_complete(config_id):
-        logger.info(f"[{config_id}] Training complete.")
-        return True
-    elif success and is_phase1_complete(config_id):
-        logger.info(f"[{config_id}] Phase 1 complete, Phase 2 not done. "
-                     f"Will resume Phase 2 on next run.")
-        return False
-    else:
-        logger.error(f"[{config_id}] Training incomplete. Will resume from "
-                     f"last checkpoint on next run.")
-        return False
+    # Retry loop: transient failures (CUDA OOM, network blips) should
+    # not permanently fail a config in autonomous mode.
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        if _shutdown_requested:
+            logger.warning(f"[{config_id}] Shutdown requested before training attempt {attempt}.")
+            return False
+
+        success = run_subprocess(cmd)
+
+        if success and is_training_complete(config_id):
+            logger.info(f"[{config_id}] Training complete.")
+            return True
+        elif success and is_phase1_complete(config_id):
+            logger.info(f"[{config_id}] Phase 1 complete, Phase 2 not done. "
+                         f"Will resume Phase 2 on next run.")
+            return False
+        else:
+            if attempt < max_retries:
+                logger.warning(
+                    f"[{config_id}] Training attempt {attempt}/{max_retries} incomplete. "
+                    f"Retrying in 30s (will resume from last DeepSpeed checkpoint)..."
+                )
+                time.sleep(30)
+            else:
+                logger.error(
+                    f"[{config_id}] Training failed after {max_retries} attempts. "
+                    f"Will resume from last checkpoint on next run."
+                )
+                return False
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +538,11 @@ def run_full_sweep(
     logger.info(f"  Phase: {phase}")
     logger.info(f"  Start: {datetime.now(timezone.utc).isoformat()}")
     logger.info(f"=" * 60)
+
+    # Record expected eval count in state so monitor.sh shows correct
+    # denominator even when --seeds overrides the YAML default.
+    state["expected_total_evals"] = len(config_ids) * len(seeds)
+    save_state(state)
 
     all_complete = True
 
