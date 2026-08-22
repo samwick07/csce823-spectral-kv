@@ -109,10 +109,21 @@ def evaluate_longbench(
             # Load task data from HuggingFace
             from datasets import load_dataset
 
-            dataset = load_dataset(
-                "THUDM/LongBench", task_name, split="test",
-                trust_remote_code=True,
-            )
+            # THUDM/LongBench uses a loading script (deprecated in datasets 3+).
+            # Xnhyacinth/LongBench is a parquet mirror with the same task names.
+            lb_names = [
+                ("Xnhyacinth/LongBench", {}),
+                ("THUDM/LongBench", {"trust_remote_code": True}),
+            ]
+            dataset = None
+            for lb_name, lb_kwargs in lb_names:
+                try:
+                    dataset = load_dataset(lb_name, task_name, split="test", **lb_kwargs)
+                    break
+                except Exception:
+                    continue
+            if dataset is None:
+                raise RuntimeError(f"Could not load LongBench task {task_name}")
 
             task_scores = []
 

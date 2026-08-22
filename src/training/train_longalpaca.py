@@ -101,9 +101,23 @@ def train_longalpaca(
         logger.warning(f"W&B init failed: {e}. Continuing without W&B.")
         use_wandb = False
 
-    # 6. Load and tokenize LongAlpaca-16k
-    logger.info("Loading LongAlpaca-16k dataset")
-    dataset = load_dataset("Yukang/LongAlpaca-16k", split="train")
+    # 6. Load and tokenize LongAlpaca
+    logger.info("Loading LongAlpaca dataset")
+    # LongAlpaca-16k was renamed; 12k is the current version with same format
+    la_names = [
+        "Yukang/LongAlpaca-12k",
+        "Yukang/LongAlpaca-16k",
+    ]
+    dataset = None
+    for la_name in la_names:
+        try:
+            dataset = load_dataset(la_name, split="train")
+            logger.info(f"Loaded LongAlpaca from {la_name}: {len(dataset)} rows")
+            break
+        except Exception as e:
+            logger.warning(f"Could not load {la_name}: {e}")
+    if dataset is None:
+        raise RuntimeError(f"Could not load LongAlpaca. Tried: {la_names}")
 
     def format_instruction(examples):
         """Format LongAlpaca examples as instruction-response pairs."""

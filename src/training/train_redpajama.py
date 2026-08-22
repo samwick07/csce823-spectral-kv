@@ -107,23 +107,20 @@ def train_redpajama(
 
     # 6. Load and tokenize RedPajama
     logger.info("Loading RedPajama dataset")
-    # RedPajama-Data-1T-Sample was removed from HF. Use the full 1T
-    # dataset with streaming + take(n) to get only the samples we need
-    # (1000 steps * batch_size 64 = 64K samples, pull 80K for safety).
+    # Original togethercomputer/RedPajama-Data-1T-Sample was removed.
+    # liang2kl/RedPajama-Data-1T-Sample-Backup is a parquet mirror of
+    # the exact same data (11 parquet shards, no loading script).
+    # togethercomputer/RedPajama-Data-1T (full 1T, streaming fallback).
     rp_datasets = [
-        # Original sample (removed, but try in case it returns)
         ("togethercomputer/RedPajama-Data-1T-Sample", {"split": "train"}),
-        # Full dataset via streaming — pull only what we need
+        ("liang2kl/RedPajama-Data-1T-Sample-Backup", {"split": "train"}),
         ("togethercomputer/RedPajama-Data-1T", {"split": "train", "streaming": True}),
     ]
-    rp_streaming = False
     dataset = None
     for ds_name, ds_kwargs in rp_datasets:
         try:
             dataset = load_dataset(ds_name, **ds_kwargs)
             if ds_kwargs.get("streaming"):
-                rp_streaming = True
-                # Take 80K samples from the stream (64K needed + margin)
                 from itertools import islice
                 dataset = list(islice(dataset, 80000))
                 logger.info(f"Loaded {len(dataset)} samples from {ds_name} (streaming)")

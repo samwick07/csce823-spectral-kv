@@ -51,7 +51,24 @@ def evaluate_proof_pile(
     logger.info(f"Evaluating Proof-pile: {num_samples} docs, window={window_size}")
 
     # Load Proof-pile
-    dataset = load_dataset("EleutherAI/proof-pile", split="test", trust_remote_code=True)
+    # EleutherAI/proof-pile uses a loading script (deprecated in datasets 3+).
+    # hoskinson-center/proof-pile has the same data in jsonl.gz format.
+    # EleutherAI/proof-pile-2 is the newer version (also jsonl.zst).
+    pp_names = [
+        ("hoskinson-center/proof-pile", {"split": "test"}),
+        ("EleutherAI/proof-pile-2", {"split": "test"}),
+        ("EleutherAI/proof-pile", {"split": "test", "trust_remote_code": True}),
+    ]
+    dataset = None
+    for pp_name, pp_kwargs in pp_names:
+        try:
+            dataset = load_dataset(pp_name, **pp_kwargs)
+            logger.info(f"Loaded Proof-pile from {pp_name}: {len(dataset)} rows")
+            break
+        except Exception as e:
+            logger.warning(f"Could not load {pp_name}: {e}")
+    if dataset is None:
+        raise RuntimeError(f"Could not load Proof-pile. Tried: {[n[0] for n in pp_names]}")
 
     # Select samples
     torch.manual_seed(seed)

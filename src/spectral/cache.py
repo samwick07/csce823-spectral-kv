@@ -361,7 +361,14 @@ class SpectralDynamicCache(Cache):
     """
 
     def __init__(self, spectral_caches: list[SpectralKVCache]):
-        super().__init__()
+        # transformers 4.x DynamicCache.__init__ takes no args.
+        # transformers 5.x requires layers or layer_class_to_replicate.
+        # Use a try/except to handle both APIs.
+        try:
+            super().__init__()
+        except (ValueError, TypeError):
+            # transformers 5.x: pass an empty layers list
+            super().__init__(layers=[])
         self.spectral_caches = spectral_caches
 
     def update(

@@ -170,12 +170,13 @@ from datasets import load_dataset
 
 # RedPajama-Data-1T-Sample was removed from HF. The full 1T dataset
 # is streamed at training time (only 80K samples pulled). Skip pre-caching.
-# Yukang/LongAlpaca-16k, pg19, and proof-pile are small enough to pre-cache.
+# Other datasets use corrected names (originals were renamed or use
+# deprecated loading scripts).
 
 datasets = [
-    ('Yukang/LongAlpaca-16k', 'train', {}),
-    ('deepmind/pg19', 'test', {}),
-    ('EleutherAI/proof-pile', 'test', {'trust_remote_code': True}),
+    ('Yukang/LongAlpaca-12k', 'train', {}),
+    ('emozilla/pg19-test', 'test', {}),
+    ('hoskinson-center/proof-pile', 'test', {}),
 ]
 
 for name, split, kwargs in datasets:
@@ -187,26 +188,32 @@ for name, split, kwargs in datasets:
         print(f'  WARNING: {name} failed - {e}')
         print(f'  Continuing. The training/eval code will retry at runtime.')
 
-# Verify RedPajama-Data-1T is accessible (streaming, just check first sample)
-print('Verifying: togethercomputer/RedPajama-Data-1T (streaming, first sample only)')
+# Verify RedPajama is accessible (try parquet mirror first, then streaming)
+print('Verifying: RedPajama-Data-1T-Sample (parquet mirror)')
 try:
-    ds = load_dataset('togethercomputer/RedPajama-Data-1T', split='train', streaming=True)
-    first = next(iter(ds))
-    print(f'  OK - first sample keys: {list(first.keys())}')
+    ds = load_dataset('liang2kl/RedPajama-Data-1T-Sample-Backup', split='train')
+    print(f'  OK - {len(ds)} rows from parquet mirror')
 except Exception as e:
-    print(f'  WARNING: {e}')
-    print(f'  Training will fail if this cannot be resolved.')
+    print(f'  Parquet mirror failed: {e}')
+    print(f'  Trying streaming from full 1T...')
+    try:
+        ds = load_dataset('togethercomputer/RedPajama-Data-1T', split='train', streaming=True)
+        first = next(iter(ds))
+        print(f'  OK (streaming) - first sample keys: {list(first.keys())}')
+    except Exception as e2:
+        print(f'  WARNING: {e2}')
+        print(f'  Training will fail if this cannot be resolved.')
 "
 
 # LongBench (separate due to different loading)
 echo "Downloading: LongBench V1..."
 python -c "
 from datasets import load_dataset
-# NOTE: org is THUDM (not THUIAR) — matches src/eval/longbench.py
+# Xnhyacinth/LongBench is a parquet mirror (no loading script needed)
 tasks = ['narrativeqa', 'qasper', 'multifieldqa_en', 'hotpotqa', '2wikimqa', 'musique', 'gov_report', 'qmsum', 'multi_news', 'trec', 'triviaqa', 'samsum', 'passage_count', 'passage_retrieval_en']
 for task in tasks:
     try:
-        ds = load_dataset('THUDM/LongBench', task, split='test', trust_remote_code=True)
+        ds = load_dataset('Xnhyacinth/LongBench', task, split='test')
         print(f'  {task}: {len(ds)} rows')
     except Exception as e:
         print(f'  {task}: WARNING - {e}')

@@ -50,7 +50,22 @@ def evaluate_pg19(
     logger.info(f"Evaluating PG-19: {num_samples} books, window={window_size}")
 
     # Load PG-19 test split
-    dataset = load_dataset("deepmind/pg19", split="test")
+    # deepmind/pg19 uses a loading script (deprecated in datasets 3+).
+    # emozilla/pg19-test is a parquet mirror that works without scripts.
+    pg19_names = [
+        "emozilla/pg19-test",
+        "deepmind/pg19",
+    ]
+    dataset = None
+    for pg_name in pg19_names:
+        try:
+            dataset = load_dataset(pg_name, split="test")
+            logger.info(f"Loaded PG-19 from {pg_name}: {len(dataset)} rows")
+            break
+        except Exception as e:
+            logger.warning(f"Could not load {pg_name}: {e}")
+    if dataset is None:
+        raise RuntimeError(f"Could not load PG-19. Tried: {pg19_names}")
 
     # Select samples
     torch.manual_seed(seed)
