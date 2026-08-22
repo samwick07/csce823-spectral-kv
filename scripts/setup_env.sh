@@ -61,6 +61,11 @@ else
     echo -e "${GREEN}HF_TOKEN: set${NC}"
 fi
 
+# Allow loading datasets with custom scripts (proof-pile, etc.)
+# Without this, datasets like hoskinson-center/proof-pile prompt
+# for confirmation and block in non-interactive scripts.
+export HF_DATASETS_TRUST_REMOTE_CODE=1
+
 # Disk space check (need ~200 GB for model + datasets + checkpoints)
 AVAILABLE_GB=$(df -BG --output=avail "$PROJECT_ROOT" | tail -1 | tr -dc '0-9')
 if [[ "$AVAILABLE_GB" -lt 200 ]]; then
