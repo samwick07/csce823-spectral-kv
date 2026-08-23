@@ -54,7 +54,21 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 STATE_FILE = RESULTS_DIR / "orchestrator_state.json"
 LOG_DIR = PROJECT_ROOT / "logs"
 
-ALL_CONFIG_IDS = [f"C{i:02d}" for i in range(13)]
+ALL_CONFIG_IDS = [
+    "C00",  # Baseline
+    "C01",  # DCT + fixed + 0.50  (FreqKV reproduction — safest, validates spectral path)
+    "C07",  # FFT + fixed + 0.50  (phase preservation vs DCT, same gamma)
+    "C10",  # FFT + learnable + 0.50  (full proposed method — headline result)
+    "C04",  # DCT + learnable + 0.50  (completes 2x2 at gamma=0.5)
+    "C02",  # DCT + fixed + 0.22  (ratio exploration begins)
+    "C08",  # FFT + fixed + 0.22  (phase preservation at higher compression)
+    "C11",  # FFT + learnable + 0.22  (proposed method at 0.22)
+    "C05",  # DCT + learnable + 0.22  (completes 2x2 at 0.22)
+    "C03",  # DCT + fixed + 0.01  (aggressive — may not converge)
+    "C09",  # FFT + fixed + 0.01  (aggressive — may not converge)
+    "C12",  # FFT + learnable + 0.01  (aggressive — may not converge)
+    "C06",  # DCT + learnable + 0.01  (aggressive — may not converge)
+]
 PILOT_CONFIG_IDS = ["C00", "C07", "C10"]
 PILOT_SEEDS = list(range(5))
 
