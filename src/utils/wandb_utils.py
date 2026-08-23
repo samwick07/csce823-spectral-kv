@@ -14,6 +14,7 @@ and the forthcoming journal article.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Literal
 
@@ -63,6 +64,15 @@ def init_wandb(
         The wandb.Run object.
     """
     import wandb
+
+    # Rank-0 guard: in distributed training (DeepSpeed, DDP), only the main
+    # process should initialize W&B. Non-main ranks that call wandb.init with
+    # the same deterministic run ID create competing wandb-core processes that
+    # contend on the same run, causing sync stalls and data loss.
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if local_rank != 0:
+        logger.info(f"Skipping W&B init on non-main rank (LOCAL_RANK={local_rank})")
+        return None
 
     # Build the config dict from the dataclass
     from dataclasses import asdict
@@ -258,6 +268,12 @@ def finish_wandb(final_metrics: dict | None = None) -> None:
         final_metrics: Optional final metrics to log before finishing.
     """
     import wandb
+
+    # Rank-0 guard: non-main ranks never initialized W&B (see init_wandb).
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if local_rank != 0:
+        logger.debug(f"Skipping W&B finish on non-main rank (LOCAL_RANK={local_rank})")
+        return
 
     if final_metrics:
         wandb.log(final_metrics)
