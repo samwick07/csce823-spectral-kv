@@ -99,17 +99,43 @@ def init_wandb(
     # between Phase 1 (steps 10-1000) and Phase 2 (steps 10-50).
     run_id = f"{config.config_id}_{phase}"
 
-    run = wandb.init(
-        id=run_id,
-        resume=resume,
-        project=project,
-        entity=entity,
-        name=f"{config.config_id}_{phase}",
-        config=config_dict,
-        tags=default_tags,
-        notes=notes or f"CSCE 823: {config.experiment_name} - {phase}",
-        dir=str(Path.cwd() / "wandb"),
-    )
+    # A stale active run (e.g. opened by the HF Trainer's WandbCallback
+    # after an earlier explicit init failed) would otherwise be silently
+    # reused by wandb.init(), merging two phases into one run.
+    if wandb.run is not None:
+        logger.info(f"Finishing stale active W&B run {wandb.run.id} before init")
+        wandb.finish()
+
+    def _init(rid: str) -> Any:
+        return wandb.init(
+            id=rid,
+            resume=resume,
+            project=project,
+            entity=entity,
+            name=f"{config.config_id}_{phase}",
+            config=config_dict,
+            tags=default_tags,
+            notes=notes or f"CSCE 823: {config.experiment_name} - {phase}",
+            dir=str(Path.cwd() / "wandb"),
+        )
+
+    try:
+        run = _init(run_id)
+    except Exception as e:
+        # Deleted deterministic IDs cannot be reused: W&B keeps deleted run
+        # IDs in a server-side registry. Fall back to a suffixed ID so
+        # training still tracks (the resume guarantee is lost only for
+        # that phase). Precedent: scripts/fix_wandb_phase1.py (C00).
+        if "previously created and deleted" not in str(e):
+            raise
+        deleted_id = run_id
+        suffix = "_retry" if len(run_id) + len("_retry") <= 25 else "_r"
+        run_id = f"{run_id}{suffix}"
+        logger.warning(
+            f"W&B run ID {deleted_id!r} was previously deleted on the "
+            f"server; initializing with {run_id!r} instead."
+        )
+        run = _init(run_id)
 
     logger.info(
         f"Initialized W&B run: {run.name} (id={run_id}, resume={resume}) "

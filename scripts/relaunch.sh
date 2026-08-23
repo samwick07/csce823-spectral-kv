@@ -21,6 +21,10 @@ cd /workspaces/csce823-spectral-kv
 if [ -f /workspaces/.env.spectral ]; then
   # shellcheck disable=SC1091
   source /workspaces/.env.spectral
+
+# Pin the W&B project (see src/utils/wandb_utils.py). Without this the
+# HF Trainer's WandbCallback defaults to the "huggingface" project.
+export WANDB_PROJECT="${WANDB_PROJECT:-csce823-spectral-kv}"
 else
   echo "WARNING: /workspaces/.env.spectral not found — relying on ambient env vars."
 fi

@@ -17,6 +17,8 @@ import json
 import logging
 from pathlib import Path
 
+import os
+
 import torch
 from datasets import load_dataset
 from peft import PeftModel
@@ -114,6 +116,12 @@ def train_longalpaca(
     except Exception as e:
         logger.warning(f"W&B init failed: {e}. Continuing without W&B.")
         use_wandb = False
+
+    # Safety net: the HF Trainer's WandbCallback (report_to="wandb") opens
+    # its own run in the default "huggingface" project unless WANDB_PROJECT
+    # is set. Pin it so that even if the explicit init_wandb() above fails,
+    # training metrics still land in the experiment project.
+    os.environ["WANDB_PROJECT"] = "csce823-spectral-kv"
 
     # 6. Load and tokenize LongAlpaca
     logger.info("Loading LongAlpaca dataset")
