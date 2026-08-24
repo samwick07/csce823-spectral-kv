@@ -23,12 +23,13 @@ touches the Phase 1 run, which has a different deterministic ID.
 """
 
 import ast
+import os
 import re
 import sys
 from pathlib import Path
 
 WANDB_PROJECT = "csce823-spectral-kv"
-RUN_ID = "C00_phase1_redpajama_clean"
+RUN_ID = "C00_phase1_redpajama_r"
 RUN_NAME = "C00 Phase 1 RedPajama (clean re-log)"
 METRICS_FILE = "c00_phase1_clean_metrics.txt"
 
@@ -50,7 +51,24 @@ def parse_metrics(path: str) -> list[dict]:
     return metrics
 
 
+def load_env():
+    """Load credentials from /workspaces/.env.spectral."""
+    from pathlib import Path
+    env_path = Path("/workspaces/.env.spectral")
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[7:]
+        if "=" in line:
+            k, v = line.split("=", 1)
+            v = v.strip().strip('"').strip("'")
+            os.environ[k] = v
+
+
 def fix_wandb_run(metrics: list[dict]) -> None:
+    load_env()
     import wandb
     from wandb.apis.public import Api
 
@@ -102,11 +120,16 @@ def fix_wandb_run(metrics: list[dict]) -> None:
         dir=str(Path.cwd() / "wandb"),
     )
 
-    # 3. Re-log the 100 clean data points
+    # 3. Re-log the 100 clean data points (train/ prefix to match HF callback)
     print(f"Re-logging {len(metrics)} data points...")
     for m in metrics:
         step = m.pop("step")
-        wandb.log(m, step=step)
+        logged = {f"train/{k}": v for k, v in m.items()}
+        wandb.log(logged, step=step)
+
+    # 4. Set summary metrics
+    if metrics:
+        wandb.summary["train/loss"] = metrics[-1].get("loss", 0)
 
     # 4. Mark as finished
     wandb.finish(exit_code=0)
