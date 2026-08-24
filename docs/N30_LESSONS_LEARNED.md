@@ -154,3 +154,52 @@ The following recovery scripts exist in `scripts/` and were tested during the N=
 10. W&B project strategy decided (free tier limits, offline mode, or paid tier)
 11. Checkpoint storage capacity verified
 12. No W&B runs deleted from the project (use tags instead)
+13. Loss computation path audited and verified comparable between spectral and baseline attention (Section 9)
+14. Per-run log files implemented: each config/phase/seed writes to an isolated log file (Section 10)
+
+---
+
+## 9. Loss Computation Verification
+
+### 9.1 The 100x Loss Gap (OBSERVED in N=1)
+
+**Issue:** During the N=1 run, compressed configs (C01, C07, C10) converged to a Phase 1 training loss of ~0.02, while the baseline (C00) maintained a flat loss of ~2.09. In Phase 2, compressed configs reached ~0.003-0.007 while the baseline sat at ~0.52. This 100x gap is abnormally large and could indicate either a genuine effect of spectral compression on the optimization landscape or a discrepancy in how loss is computed for the custom spectral attention forward pass.
+
+**Root cause unknown -- must be verified before N=30.** The spectral attention forward pass overrides `LlamaAttention.forward` with a manual SDPA implementation. If the loss computation path differs from standard causal LM loss (e.g., different masking, different normalization, or the compressed/reconstructed K-V tensors affect the logits in a way that inflates or deflates the loss), then training loss comparisons between compressed and baseline configs are not apples-to-apples.
+
+**N=30 actions:**
+- [ ] **Audit the loss computation path in the spectral attention forward pass.** Trace from `SpectralKVAttention.forward()` through the model's `forward()` to the loss function. Verify that the loss function receives the same type of logits, applies the same label masking, and uses the same reduction as the baseline path.
+- [ ] **Verify loss is computed on reconstructed (full) logits, not compressed intermediates.** The K/V tensors are compressed and reconstructed, but the output logits fed to the loss function must be full-dimensional. If loss is accidentally computed on compressed representations, it would appear artificially low.
+- [ ] **Add a unit test that compares loss output for identical inputs** between `LlamaAttention` (baseline) and `SpectralKVAttention` (gamma=1.0, no compression). With gamma=1.0, the spectral transform should be a no-op and the losses should be numerically identical (within floating point tolerance). If they differ, the forward pass has a bug.
+- [ ] **Log the loss computation path explicitly.** Add a one-time log line at training start that prints whether the model is using standard or spectral attention and which loss function is active. This makes it unambiguous in the logs which path produced the loss values.
+- [ ] **Do not cite the 100x loss gap as a result until verified.** If the loss computation is confirmed correct and the gap persists, it is a genuine finding. If it is a bug, the corrected loss values may change the relative ranking of configs.
+
+---
+
+## 10. Logging Architecture
+
+### 10.1 Monolithic Orchestrator Log (OBSERVED in N=1)
+
+**Issue:** The N=1 run wrote all config training (Phase 1 + Phase 2), all evaluation, and all statistics output to a single orchestrator log file (`logs/orchestrator_20260823_041331.log`). This file reached 788 KB and contained interleaved output from C01, C07, and C10 -- making it difficult to extract per-config loss curves, timing, or error messages without complex grep patterns. When C00 crashed and restarted 19 times, each restart created a new orchestrator log, but all phases of the resumed config were still interleaved within each log.
+
+**Impact on N=1 analysis:** Extracting per-config training metrics required grepping across 20+ log files and manually correlating timestamps. The C00 baseline data was particularly noisy because 19 crash/restart cycles fragmented its loss trajectory across multiple logs and WandB runs.
+
+### 10.2 Required Logging Structure for N=30
+
+**Principle:** Each run (config x phase x seed) must produce a unique, self-contained log file. The only exception is a safe crash resume, where the resumed run appends to the same log file with a clear `[RESUME from checkpoint-N]` marker.
+
+**N=30 actions:**
+- [ ] **Implement per-run log file naming.** Each training, evaluation, and statistics run should write to its own log file using the convention:
+  - Training: `logs/train/{config_id}_phase{N}_{dataset}_seed{S}.log`
+  - Evaluation: `logs/eval/{config_id}_seed{S}_{benchmark}.log`
+  - Statistics: `logs/stats/{step_name}.log`
+- [ ] **Modify the orchestrator to redirect subprocess output to per-run files.** The orchestrator currently captures all subprocess stdout/stderr into the monolithic orchestrator log. Instead, it should open a file handle per run and pass it as the subprocess stdout/stderr.
+- [ ] **Keep the orchestrator log as a high-level summary only.** The orchestrator log should contain only: config start/stop, phase transitions, crash/recovery events, and completion markers. All per-step training output (loss, grad_norm, lr) goes to the per-run log.
+- [ ] **Add a [RESUME] marker on crash recovery.** When a run safely resumes from a checkpoint, append to the existing per-run log file with a clearly delimited resume block:
+  ```
+  ===== [RESUME from checkpoint-N at timestamp] =====
+  ```
+  This makes it unambiguous that the log is a continuation, not a fresh run.
+- [ ] **Do not create a new log file for a resumed run.** If the orchestrator detects that a per-run log already exists and the run is resuming from a checkpoint, it must append to the existing file. A new file is only created for a fresh run (no existing checkpoint).
+- [ ] **Add a log index to the orchestrator state.** Track the per-run log file path in `orchestrator_state.json` so that post-experiment analysis can programmatically locate each run's log without guessing the naming convention.
+- [ ] **Test the logging structure with a pilot run.** Before N=30, run 2-3 configs through the new logging pipeline and verify that each config/phase/seed produces a clean, isolated log file with no interleaving.
