@@ -203,3 +203,63 @@ The following recovery scripts exist in `scripts/` and were tested during the N=
 - [ ] **Do not create a new log file for a resumed run.** If the orchestrator detects that a per-run log already exists and the run is resuming from a checkpoint, it must append to the existing file. A new file is only created for a fresh run (no existing checkpoint).
 - [ ] **Add a log index to the orchestrator state.** Track the per-run log file path in `orchestrator_state.json` so that post-experiment analysis can programmatically locate each run's log without guessing the naming convention.
 - [ ] **Test the logging structure with a pilot run.** Before N=30, run 2-3 configs through the new logging pipeline and verify that each config/phase/seed produces a clean, isolated log file with no interleaving.
+
+---
+
+## 11. Pod Eviction from Disk Pressure (FIXED Aug 26, 2026)
+
+### 11.1 Incident Summary
+
+**Date:** August 25-26, 2026
+**Run affected:** C11_phase2_longalpaca (crash #20 in orchestrator state)
+**Impact:** Training killed at step 638/940 (68% complete, epoch 3.35). Pod was recreated by Kubernetes, losing all ephemeral state. ~22 minutes of training lost (steps 601-638, recovered from checkpoint-600).
+
+**Root cause:** Kubernetes evicted the pod due to disk pressure on the node. The HuggingFace model cache (~55 GB for Llama-3.1-8B-Instruct + dataset caches) was stored on the ephemeral container overlay filesystem (`$HOME/.cache/huggingface/`), which is wiped on every pod stop/start. The overlay reached 94.3% capacity (208.3 GB / 233 GB), triggering kubelet eviction.
+
+**Evidence:**
+- Pod hostname changed from `...-rpkjm` (during crash) to `...-tqr5l` (after restart), confirming pod recreation.
+- Orchestrator log cut off mid-step at step 638 with no Python traceback, no SIGTERM handler invoked, and no error message — the process was SIGKILLed externally.
+- WandB system metrics showed disk at 94.3% throughout the run, climbing from 93.6% at start.
+- Root overlay dropped from 94.3% to 66% after pod recreation (the 55 GB HF cache was gone).
+- No dmesg/journalctl access inside the container (Kubernetes hides host kernel logs).
+
+### 11.2 Why It Did Not Gracefully Resume
+
+Two independent failures prevented automatic recovery:
+
+**Failure 1: No autostart mechanism.** The orchestrator was launched with `setsid nohup`, which survives SSH disconnects and workspace agent restarts but NOT pod recreation. When Kubernetes killed the pod, PID 1 (`./coder agent`) and all child processes died. The new pod had no crontab, no systemd service, and no Coder startup script to relaunch the orchestrator. The `.orchestrator_pid` file pointed to a dead PID (245570).
+
+**Failure 2: HF cache wiped.** The live HF model cache lived on the ephemeral overlay (`$HOME/.cache/huggingface/`). When the pod was recreated, the overlay was reset to a clean state. A backup existed on the PVC at `/workspaces/hf-cache-backup/` (created by `run.sh`'s cache backup logic), but the `run.sh` restore logic only checked for the model marker in `$HOME/.cache/huggingface/` — it would have restored on next launch, but there was no launch happening because no autostart existed.
+
+### 11.3 Fixes Applied
+
+**Fix 1: HF cache moved to persistent PVC.**
+- Copied the 55 GB model cache from `/workspaces/hf-cache-backup/` to `/workspaces/.cache/huggingface/` (on the 1 TB Longhorn PVC).
+- Added `export HF_HOME="/workspaces/.cache/huggingface"` and `export TRANSFORMERS_CACHE="/workspaces/.cache/huggingface/hub"` to `/workspaces/.env.spectral`.
+- Patched `scripts/run.sh` to use `HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"` instead of the hardcoded `$HOME/.cache/huggingface`. This ensures `run.sh` checks the PVC-backed location for the model marker and only restores from backup if truly missing.
+- Root overlay now stays at 66% instead of climbing to 94%+ during training.
+
+**Fix 2: Watchdog auto-restart mechanism.**
+- Created `scripts/watchdog.sh`: a lightweight polling daemon that checks every 5 minutes whether the orchestrator PID is alive. If dead and work remains (training incomplete, evals pending, or analysis/exfil not done), it sources `/workspaces/.env.spectral` and calls `scripts/relaunch.sh`.
+- Added a line to `~/.bashrc` that starts the watchdog via `nohup` on any new shell session (which happens after a pod restart when someone SSHs in or VS Code connects).
+- The watchdog checks `results/orchestrator_state.json` to avoid restarting when all work is complete.
+- Note: `crontab` and `systemd` are not available in this container image. The `.bashrc` approach is a pragmatic fallback — it requires at least one shell session to start after a pod restart. A more robust solution would be a Coder workspace startup script or a Kubernetes init container.
+
+### 11.4 Verification
+
+After applying fixes and relaunching:
+- Orchestrator started as PID 302416, detected 4 GPUs, loaded state (crash_count: 20).
+- Skipped 7 completed configs (C00, C01, C02, C04, C07, C08, C10) automatically.
+- C11 Phase 2 resumed from `checkpoints/C11/phase2_longalpaca/checkpoint-600` (confirmed in log: "Resuming Phase 2 from checkpoints/C11/phase2_longalpaca/checkpoint-600").
+- WandB confirmed run resume: "Resuming run C11_phase2_longalpaca".
+- All 4x H200 GPUs at 100% utilization, training at step 602+ with ~33s/step.
+- Root disk stable at 66% (no HF cache on overlay).
+
+### 11.5 Remaining Hardening for N=30
+
+- [ ] **Set `HF_HOME` globally in the Coder workspace template** (not just `.env.spectral`). This ensures all processes — including eval scripts, analysis scripts, and ad-hoc Python — use the PVC-backed cache.
+- [ ] **Add a disk pressure pre-flight check.** Before launching training, verify root overlay usage is below 80% and PVC has at least 100 GB free. Fail fast if disk is critical.
+- [ ] **Consider a Kubernetes liveness/readiness probe** that checks orchestrator PID health. If the orchestrator dies, Kubernetes can restart the pod (which would trigger the watchdog via `.bashrc`). This is more reliable than relying on a shell session.
+- [ ] **Set `HF_HUB_OFFLINE=1` after model load.** This was already noted in Section 1.2 but is especially relevant here: if PEFT doesn't try to fetch `config.json` from HuggingFace at every checkpoint save, there's no network dependency during training and no risk of a network error killing a checkpoint save.
+- [ ] **Monitor PVC disk usage.** With the HF cache now on PVC (55 GB) plus checkpoints (~8 GB) plus venv (~7 GB), PVC usage is at 13% (128 GB / 1 TB). This is healthy, but N=30 will add ~78 GB of checkpoints. Add PVC usage to the health check dashboard.
+- [ ] **Document the `save_total_limit` interaction with crash recovery.** Phase 2 uses `save_total_limit=5`, meaning only the 5 most recent checkpoints are kept. If a crash happens after step 600 and training resumes from checkpoint-600, the older checkpoints (200-500) are deleted by the trainer to enforce the limit. This is correct behavior but means there's no way to roll back further than the 5th-newest checkpoint.

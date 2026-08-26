@@ -198,7 +198,7 @@ fi
 # workspace stop/start. /workspaces is a persistent PVC, so a backup of the
 # cache there survives restarts. If the cache is gone but a backup exists,
 # restore it to avoid a ~16GB gated-model re-download.
-HF_CACHE_DIR="$HOME/.cache/huggingface"
+HF_CACHE_DIR="${HF_HOME:-$HOME/.cache/huggingface}"
 HF_BACKUP_DIR="/workspaces/hf-cache-backup"
 MODEL_MARKER="$HF_CACHE_DIR/hub/models--meta-llama--Llama-3.1-8B-Instruct"
 BACKUP_MARKER="$HF_BACKUP_DIR/hub/models--meta-llama--Llama-3.1-8B-Instruct"
