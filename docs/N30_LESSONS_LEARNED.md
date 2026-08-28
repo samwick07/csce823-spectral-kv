@@ -263,3 +263,82 @@ After applying fixes and relaunching:
 - [ ] **Set `HF_HUB_OFFLINE=1` after model load.** This was already noted in Section 1.2 but is especially relevant here: if PEFT doesn't try to fetch `config.json` from HuggingFace at every checkpoint save, there's no network dependency during training and no risk of a network error killing a checkpoint save.
 - [ ] **Monitor PVC disk usage.** With the HF cache now on PVC (55 GB) plus checkpoints (~8 GB) plus venv (~7 GB), PVC usage is at 13% (128 GB / 1 TB). This is healthy, but N=30 will add ~78 GB of checkpoints. Add PVC usage to the health check dashboard.
 - [ ] **Document the `save_total_limit` interaction with crash recovery.** Phase 2 uses `save_total_limit=5`, meaning only the 5 most recent checkpoints are kept. If a crash happens after step 600 and training resumes from checkpoint-600, the older checkpoints (200-500) are deleted by the trainer to enforce the limit. This is correct behavior but means there's no way to roll back further than the 5th-newest checkpoint.
+
+---
+
+## 12. Evaluation Phase Fixes (FIXED Aug 28, 2026)
+
+### 12.1 Incident Summary
+
+**Date:** August 28, 2026
+**Phase affected:** Evaluation (all 13 configs, seed=0)
+**Impact:** All eval runs crashed at the Proof-pile benchmark stage. PG-19 results were computed but never logged to WandB due to a separate import failure. Zero eval results were saved to disk, WandB, HuggingFace, or GitHub.
+
+### 12.2 Root Causes and Fixes
+
+Three independent issues combined to block the entire evaluation phase:
+
+**Issue 1: Proof-pile dataset crash (RuntimeError at proof_pile.py:71)**
+
+All three Proof-pile dataset sources failed in sequence:
+- `hoskinson-center/proof-pile` — HTTP 429 Too Many Requests. Four parallel eval jobs (one per GPU) simultaneously attempted to download the 523 MB `proofpile_train_5.jsonl.gz` file, triggering HuggingFace Hub rate limiting.
+- `EleutherAI/proof-pile-2` — `No module named 'zstandard'`. The `zstandard` Python package was not installed in the venv, but `proof-pile-2` stores data in `.jsonl.zst` format which requires it for decompression.
+- `EleutherAI/proof-pile` — Dataset no longer exists on the Hub (deprecated in favor of proof-pile-2).
+
+After all three sources failed, the code raised `RuntimeError("Could not load Proof-pile")`, killing the eval process for that config. Since every config hit the same error, all 13 eval runs failed.
+
+**Fix applied:**
+- Installed `zstandard` (v0.25.0) in the venv and added it to `requirements.txt`.
+- Pre-downloaded `hoskinson-center/proof-pile` (test split, 46,251 rows) to the PVC-backed HF cache via `scripts/preload_datasets.py`, eliminating runtime downloads and 429 collisions.
+- Added `trust_remote_code=True` to the `EleutherAI/proof-pile-2` load call (required by `datasets` 3.x for datasets with custom loading scripts).
+- Added retry logic with exponential backoff (30s, 60s) for 429 errors in `src/eval/proof_pile.py`, so transient rate limits don't kill an eval run.
+
+**Issue 2: WandB init failure in eval mode ("attempted relative import with no known parent package")**
+
+The orchestrator launches eval subprocesses as `python src/run_experiment.py` (script mode), not `python -m src.run_experiment` (module mode). In script mode, Python does not set `__package__`, so the relative import `from .utils.wandb_utils` inside `run_evaluation()` fails with `ImportError: attempted relative import with no known parent package`.
+
+The top of `run_experiment.py` already had a try/except fallback for this (using absolute imports via `sys.path.insert`), but the W&B import inside `run_evaluation()` was a separate relative import with no fallback. When it failed, the code caught the exception and logged `"W&B init failed: ... Continuing without W&B."` — meaning PG-19 perplexity results were computed but silently dropped on the floor.
+
+**Fix applied:**
+- Added a try/except ImportError fallback on the W&B import inside `run_evaluation()` in `src/run_experiment.py`, mirroring the existing pattern at the top of the file:
+  ```python
+  try:
+      from .utils.wandb_utils import init_wandb, log_eval_results, finish_wandb
+  except ImportError:
+      from src.utils.wandb_utils import init_wandb, log_eval_results, finish_wandb
+  ```
+
+**Issue 3: No GitHub results push**
+
+The `.gitignore` excludes `results/`, `checkpoints/`, and `logs/` to keep the repo lean during development. The existing `scripts/exfil.sh` uploads to HuggingFace Hub only. There was no mechanism to push eval result JSONs to GitHub for version control and collaboration.
+
+**Fix applied:**
+- Created `scripts/push_results_github.sh`: force-adds eval result JSONs (bypassing `.gitignore`), commits with a descriptive message including timestamp, and pushes to origin.
+- Added a "Phase 4b: GitHub Push" stage to `src/orchestrator.py` that runs after the HF Hub exfil completes, calling the push script as a subprocess.
+
+### 12.3 Verification
+
+A smoke test of C00 (baseline) confirmed all three fixes work end-to-end:
+- **W&B:** `"Initialized W&B run: C00_eval_seed0"` and `"Logged pg19 eval results to W&B"` and `"Logged proof_pile eval results to W&B"` — all metrics syncing to `https://wandb.ai/samwick07-afit/csce823-spectral-kv`.
+- **Proof-pile:** `"Loaded Proof-pile from hoskinson-center/proof-pile: 46251 rows"` and `"Proof-pile results: mean=6.14, median=5.46"` — no crash, no 429, no zstandard error.
+- **Full eval launched:** All 13 configs (C00-C12) running in 4 batches of 4 across GPUs 0-3. C00 completed PG-19 (mean=15.88) and Proof-pile (mean=6.14), entered LongBench.
+
+### 12.4 Files Changed
+
+| File | Change |
+|------|--------|
+| `src/eval/proof_pile.py` | Added `trust_remote_code=True` for proof-pile-2, retry logic with backoff for 429 errors |
+| `src/run_experiment.py` | Added try/except ImportError fallback for W&B import in `run_evaluation()` |
+| `src/orchestrator.py` | Added "Phase 4b: GitHub Push" stage after HF exfil |
+| `requirements.txt` | Added `zstandard` |
+| `scripts/push_results_github.sh` | New script: force-add results JSONs, commit, push to GitHub |
+| `scripts/preload_datasets.py` | New script: pre-download eval datasets to HF cache |
+
+### 12.5 Remaining Hardening for N=30
+
+- [ ] **Add `zstandard` to the Coder workspace template.** The venv install is ephemeral — if the pod is recreated, the package will be missing again. Either add it to `setup_env.sh` or the workspace Dockerfile.
+- [ ] **Pre-download ALL eval datasets before launching eval.** PG-19 and Proof-pile are now cached, but LongBench V1 (14 tasks) is still downloaded at eval time. For N=30 (390 eval runs), parallel downloads will cause 429 storms. Add LongBench datasets to `scripts/preload_datasets.py`.
+- [ ] **Add a pre-eval dataset check to the orchestrator.** Before launching eval subprocesses, verify that all benchmark datasets are cached locally. Fail fast with a clear message if any are missing, rather than crashing mid-eval after wasting GPU time on PG-19.
+- [ ] **Audit all relative imports in `src/`.** The W&B import was the second instance of this pattern (the first was fixed at the top of `run_experiment.py`). Any remaining `from .module import ...` statements inside functions will fail in script mode. Run a grep audit and add fallbacks proactively.
+- [ ] **Stagger parallel eval launches by 30s.** Even with cached datasets, 4 simultaneous model loads can cause transient GPU memory spikes. A small stagger between GPU launches would reduce OOM risk without meaningfully increasing wall-clock time.
+- [ ] **Add eval result verification to the orchestrator.** After each eval subprocess completes, verify that `all_results.json` exists, is valid JSON, and contains all 4 benchmark keys (`pg19`, `proof_pile`, `longbench`, `efficiency`). This prevents silent partial results from being marked as complete.
