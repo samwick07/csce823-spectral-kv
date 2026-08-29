@@ -164,8 +164,10 @@ def is_phase1_complete(config_id: str) -> bool:
 def is_eval_complete(config_id: str, seed: int) -> bool:
     """Check if evaluation for a given config+seed is complete.
 
-    An eval is complete when the all_results.json file exists and is
-    valid JSON (not a partial write from a crash).
+    An eval is complete when the all_results.json file exists, is valid JSON,
+    and all four benchmark sections (pg19, proof_pile, longbench, efficiency)
+    are present with non-error results. This prevents silently accepting
+    partial results where some benchmarks failed (e.g. LongBench OOM).
     """
     result_file = (
         RESULTS_DIR / "raw" / config_id / f"seed_{seed}" / "all_results.json"
@@ -175,11 +177,73 @@ def is_eval_complete(config_id: str, seed: int) -> bool:
     try:
         with open(result_file) as f:
             data = json.load(f)
-        # Verify it has the expected top-level keys
-        return "config_id" in data and "seed" in data
+        if "config_id" not in data or "seed" not in data:
+            return False
+        # Verify all four benchmark sections are present and not errored
+        for bench in ("pg19", "proof_pile", "longbench", "efficiency"):
+            if bench not in data:
+                return False
+            bench_data = data[bench]
+            if isinstance(bench_data, dict) and "error" in bench_data:
+                return False
+            # Check for LongBench all-task-failure (overall_mean=0 with all
+            # tasks having errors)
+            if bench == "longbench":
+                tasks = bench_data.get("tasks", {})
+                if tasks and all("error" in t for t in tasks.values()):
+                    return False
+                if not tasks:
+                    return False
+        return True
     except (json.JSONDecodeError, OSError):
         return False
 
+
+
+
+def is_eval_phase_complete(
+    config_id: str, seed: int, phase: str
+) -> bool:
+    """Check if a specific eval phase is complete for a config+seed.
+
+    Phase "quick":   pg19 + proof_pile + efficiency present and non-error.
+    Phase "longbench": longbench present and non-error (tasks exist, not all errors).
+    Phase "all":      all four benchmarks present and non-error (same as is_eval_complete).
+    """
+    result_file = (
+        RESULTS_DIR / "raw" / config_id / f"seed_{seed}" / "all_results.json"
+    )
+    if not result_file.exists():
+        return False
+    try:
+        with open(result_file) as f:
+            data = json.load(f)
+        if "config_id" not in data or "seed" not in data:
+            return False
+
+        if phase in ("quick", "all"):
+            for bench in ("pg19", "proof_pile", "efficiency"):
+                if bench not in data:
+                    return False
+                bench_data = data[bench]
+                if isinstance(bench_data, dict) and "error" in bench_data:
+                    return False
+
+        if phase in ("longbench", "all"):
+            if "longbench" not in data:
+                return False
+            lb = data["longbench"]
+            if isinstance(lb, dict) and "error" in lb:
+                return False
+            tasks = lb.get("tasks", {}) if isinstance(lb, dict) else {}
+            if not tasks:
+                return False
+            if all("error" in t for t in tasks.values()):
+                return False
+
+        return True
+    except (json.JSONDecodeError, OSError):
+        return False
 
 def get_phase2_checkpoint(config_id: str) -> str | None:
     """Get path to Phase 2 checkpoint if it exists."""
@@ -537,6 +601,7 @@ def run_full_sweep(
     seeds: list[int],
     hf_token: str | None,
     phase: str = "full",
+    eval_phase: str = "all",
 ) -> bool:
     """Run the full experiment pipeline with auto-resume.
 
@@ -564,6 +629,7 @@ def run_full_sweep(
     logger.info(f"  Total eval runs: {len(config_ids) * len(seeds)}")
     logger.info(f"  GPUs: {num_gpus}")
     logger.info(f"  Phase: {phase}")
+    logger.info(f"  Eval phase: {eval_phase}")
     logger.info(f"  Start: {datetime.now(timezone.utc).isoformat()}")
     logger.info(f"=" * 60)
 
@@ -618,6 +684,17 @@ def run_full_sweep(
         # Previous behavior: outer loop over configs (sequential), inner loop
         # over seeds (parallel). For N=1 this left 3 of 4 GPUs idle.
 
+        # Determine which benchmarks to run based on eval_phase
+        if eval_phase == "quick":
+            eval_benchmarks = "pg19,proof_pile,efficiency"
+            phase_check_fn = lambda cid, s: is_eval_phase_complete(cid, s, "quick")
+        elif eval_phase == "longbench":
+            eval_benchmarks = "longbench"
+            phase_check_fn = lambda cid, s: is_eval_phase_complete(cid, s, "longbench")
+        else:
+            eval_benchmarks = None  # run all
+            phase_check_fn = lambda cid, s: is_eval_complete(cid, s)
+
         # Build flat work queue of (config_id, seed) pairs
         eval_queue: list[tuple[str, int]] = []
         for config_id in config_ids:
@@ -630,9 +707,12 @@ def run_full_sweep(
 
             for seed in seeds:
                 eval_key = f"{config_id}_seed{seed}"
-                if eval_key in state["completed_evals"]:
-                    continue
-                if is_eval_complete(config_id, seed):
+                # Check phase-specific completion first.
+                # A config may be in completed_evals from a previous phase
+                # (e.g. quick) but still need work for the current phase
+                # (e.g. longbench). Only skip if the current phase is actually
+                # complete.
+                if phase_check_fn(config_id, seed):
                     if eval_key not in state["completed_evals"]:
                         state["completed_evals"].append(eval_key)
                         save_state(state)
@@ -681,6 +761,8 @@ def run_full_sweep(
                         "--mode", "eval",
                         "--seed", str(seed),
                     ]
+                    if eval_benchmarks:
+                        cmd.extend(["--benchmarks", eval_benchmarks])
                     if checkpoint:
                         cmd.extend(["--checkpoint", checkpoint])
                     if hf_token:
@@ -716,7 +798,7 @@ def run_full_sweep(
                         pass
                     p.wait()
 
-                    if p.returncode == 0 and is_eval_complete(config_id, seed):
+                    if p.returncode == 0 and phase_check_fn(config_id, seed):
                         logger.info(f"[{config_id} seed={seed}] Eval complete.")
                         eval_key = f"{config_id}_seed{seed}"
                         if eval_key not in state["completed_evals"]:
@@ -767,6 +849,27 @@ def run_full_sweep(
             all_complete = False
             logger.warning("Exfiltration failed. Run manually: bash scripts/exfil.sh")
 
+    # --- Phase 4b: GitHub Push ---
+    if phase in ("analyze", "full") and not _shutdown_requested and state.get("completed_exfil"):
+        task = "github_push"
+        state["current_task"] = task
+        save_state(state)
+
+        logger.info(f"\n{'='*60}")
+        logger.info(f"  GITHUB PUSH (Results)")
+        logger.info(f"{'='*60}")
+
+        github_cmd = ["bash", "scripts/push_results_github.sh"]
+        github_success = run_subprocess(github_cmd, log_prefix="[github]")
+
+        if github_success:
+            state["completed_github_push"] = True
+            save_state(state)
+            logger.info("GitHub push complete. Results committed to repo.")
+        else:
+            all_complete = False
+            logger.warning("GitHub push failed. Run manually: bash scripts/push_results_github.sh")
+
     # --- Final state ---
     state["current_task"] = "complete" if all_complete else "interrupted"
     save_state(state)
@@ -798,6 +901,14 @@ def main():
         choices=["train", "eval", "analyze", "full"],
         default="full",
         help="Which phase to run (default: full)",
+    )
+    parser.add_argument(
+        "--eval-phase", type=str,
+        choices=["quick", "longbench", "all"],
+        default="all",
+        help="Eval sub-phase: 'quick' (pg19+proof_pile+efficiency only), "
+             "'longbench' (LongBench only, merges with existing results), "
+             "or 'all' (default, runs everything)",
     )
     parser.add_argument(
         "--pilot", action="store_true",
@@ -885,7 +996,7 @@ def main():
     logger.info(f"Log file: {log_file}")
     logger.info(f"State file: {STATE_FILE}")
 
-    success = run_full_sweep(config_ids, seeds, hf_token, phase=args.phase)
+    success = run_full_sweep(config_ids, seeds, hf_token, phase=args.phase, eval_phase=args.eval_phase)
     sys.exit(0 if success else 1)
 
 

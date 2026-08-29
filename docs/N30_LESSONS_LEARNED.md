@@ -610,3 +610,114 @@ The metrics file is the only source for:
 - **Cost-benefit analysis**: does the memory savings from lower gamma justify the perplexity degradation? This requires both quality metrics (perplexity, LongBench) and efficiency metrics (memory, latency) for the same config.
 
 Without this data, the research cannot answer "how much memory does spectral KV-cache compression save, and at what cost in latency and quality?" -- which is the central question of the dissertation.
+
+---
+
+## 22. Eval GPU Contention, Duplicate Orchestrators, and Phased Eval (FIXED Aug 29, 2026)
+
+### 22.1 Incident Summary
+
+**Date:** August 28-29, 2026
+**Run affected:** Eval v3 (all 13 configs, seed 0)
+**Impact:** Only 2 of 13 evals completed after 19 hours. 4 configs OOM-killed during LongBench. GPUs 2 and 3 stalled at 0% utilization for 6+ hours with 3 processes each. Entire eval phase had to be killed and restarted with a new strategy.
+
+**Root causes (three independent failures):**
+
+1. **Duplicate orchestrator processes:** The watchdog script (`scripts/watchdog.sh`) detected the orchestrator PID as dead (it had finished training and the PID file was stale) and called `relaunch.sh`, which started a SECOND orchestrator with `run.sh --seeds 0` (no eval phase argument, running all 4 benchmarks). This second orchestrator launched its own set of eval subprocesses on the same 4 GPUs, while the first orchestrators subprocesses were still running. Result: 10 eval processes fighting over 4 GPUs, each GPU hosting 2-3 model instances.
+
+
+---
+
+## 22. Eval GPU Contention, Duplicate Orchestrators, and Phased Eval (FIXED Aug 29, 2026)
+
+### 22.1 Incident Summary
+
+**Date:** August 28-29, 2026
+**Run affected:** Eval v3 (all 13 configs, seed 0)
+**Impact:** Only 2 of 13 evals completed after 19 hours. 4 configs OOM-killed during LongBench. GPUs 2 and 3 stalled at 0% utilization for 6+ hours with 3 processes each. Entire eval phase had to be killed and restarted with a new strategy.
+
+**Root causes (three independent failures):**
+
+1. **Duplicate orchestrator processes:** The watchdog script detected the orchestrator PID as dead (it had finished training and the PID file was stale) and called `relaunch.sh`, which started a SECOND orchestrator with `run.sh --seeds 0` (no eval phase argument, running all 4 benchmarks). This second orchestrator launched its own set of eval subprocesses on the same 4 GPUs, while the first orchestrator's subprocesses were still running. Result: 10 eval processes fighting over 4 GPUs, each GPU hosting 2-3 model instances.
+
+2. **LongBench OOM under contention:** LongBench generation requires significant KV-cache memory (sequences up to 16K tokens). With 2-3 processes sharing each GPU (each loading a 16GB model), there was no room for the KV cache. The OOM killer (exit=-9) struck 4 configs (C01, C04, C07, C10) during LongBench, after they had successfully completed PG-19 and Proof-pile. The orchestrator retried them, but the retry hit the same contention.
+
+3. **No phased eval strategy:** The orchestrator ran all 4 benchmarks (PG-19, Proof-pile, LongBench, efficiency) in a single `run_experiment.py` call per config. LongBench takes ~12 hours per config (dominated by generation across 14 tasks x 200 samples), while PG-19 and Proof-pile each take ~5-7 minutes. When LongBench OOM-killed a process, all results were lost -- including the already-completed PG-19 and Proof-pile data -- because `is_eval_complete()` required ALL 4 benchmarks to be present.
+
+### 22.2 Evidence
+
+- 10 eval processes across 4 GPUs (verified via `nvidia-smi --query-compute-apps`):
+  - GPU 0: 2 processes (C08 old + C02 new), 25% util, 25GB used
+  - GPU 1: 3 processes (C08 old + C09 old + C08 new), 91% util, 66GB used
+  - GPU 2: 3 processes (C11 old + C12 old + C11 new), 0% util, 54GB used (stalled)
+  - GPU 3: 3 processes (C05 old + C06 old + C05 new), 0% util, 55GB used (stalled)
+- 15 total OOM kills (exit=-9) across all log files
+- Only C02 and C03 completed successfully (each took ~12.5 hours)
+- C00 was marked complete in `orchestrator_state.json` but had zero result files (known false-complete bug from the `is_eval_complete` fix, which was already patched but C00's stale state wasn't cleared)
+
+### 22.3 Fixes Applied
+
+**Fix 1: Phased evaluation strategy**
+
+Added `--benchmarks` flag to `src/run_experiment.py`:
+- Accepts comma-separated benchmark names (e.g., `--benchmarks pg19,proof_pile,efficiency`)
+- When running a subset, existing results are loaded from `all_results.json` and merged (not overwritten)
+- Each benchmark section is guarded with `if bench_name in run_benchmarks:` / `else: skip`
+
+Added `--eval-phase` flag to `src/orchestrator.py`:
+- `quick`: Runs only pg19 + proof_pile + efficiency (completes in ~7 min/config vs ~12 hr/config)
+- `longbench`: Runs only LongBench, merges with existing quick-phase results
+- `all`: Default, runs everything (backward compatible)
+
+Added `is_eval_phase_complete()` function to check phase-specific completion:
+- `quick` phase: pg19 + proof_pile + efficiency present and non-error
+- `longbench` phase: longbench present with non-empty tasks
+- `all` phase: same as `is_eval_complete()`
+
+**Fix 2: Phase-aware queue building**
+
+Fixed a bug where `completed_evals` from a previous phase (quick) caused the orchestrator to skip configs that still needed LongBench. The queue-building logic now checks `phase_check_fn()` FIRST, and only adds to `completed_evals` if the current phase is actually complete. Previously, the `if eval_key in state["completed_evals"]: continue` check ran before the phase check, short-circuiting any config that had been marked complete during a different phase.
+
+**Fix 3: Watchdog and relaunch phase preservation**
+
+Updated `scripts/relaunch.sh` to accept and pass through CLI args. When launched with `--eval-phase quick`, it saves the phase to `.eval_phase` file. When launched without args, it checks for a saved phase and resumes with it.
+
+Updated `scripts/watchdog.sh` to read `.eval_phase` and pass the correct phase to `relaunch.sh`. Previously, the watchdog always called `relaunch.sh` with no args, which defaulted to `run.sh --seeds 0` (all benchmarks), ignoring any phased eval strategy.
+
+**Fix 4: Process cleanup before relaunch**
+
+Killed all 10 orphaned eval processes, 3 orchestrator instances, and 6 wandb helper processes before relaunching. Verified all 4 GPUs at 0% util / 0 MiB before starting the new eval.
+
+### 22.4 Verification
+
+Phase A (quick eval: PG-19 + Proof-pile + efficiency):
+- 11 configs (C02, C03 already had all 4 benchmarks) completed in 21 minutes
+- 3 batches of 4/4/3 configs on 4 GPUs, ~7 min per batch
+- All 13 configs now have pg19, proof_pile, and efficiency results
+- LongBench correctly skipped: "Skipping LongBench V1 (not in benchmark list)"
+- Results merged with existing C02/C03 LongBench data
+
+Phase B (LongBench):
+- 11 configs (C02, C03 already have LongBench) launched on 4 GPUs
+- Each config runs only LongBench, merging with existing quick-phase results
+- "Merging with existing results from all_results.json (running: ['longbench'])"
+- 1 process per GPU, ~16GB each, no contention
+
+### 22.5 Remaining Hardening for N=30
+
+- [ ] **Add a PID-file lock check to run.sh.** When the watchdog calls `relaunch.sh` while another orchestrator is already running, `run.sh` detects the live PID and exits with "Experiment already running." But if the PID file is stale (points to a dead process), `run.sh` removes it and starts a new orchestrator -- even if a different orchestrator is running under a different PID. Add a `pgrep -f "src.orchestrator"` check as a secondary guard.
+- [ ] **Make the watchdog phase-aware by default.** The `.eval_phase` file is a pragmatic fix, but for N=30 the phase should be tracked in `orchestrator_state.json` itself (e.g., `"current_eval_phase": "quick"`). This survives pod restarts and is visible in `--status` output.
+- [ ] **Stagger parallel eval launches by 30s.** Even with clean GPUs and phased eval, 4 simultaneous model loads can cause transient GPU memory spikes. A small stagger would reduce OOM risk.
+- [ ] **Add LongBench memory budgeting.** LongBench generates up to 16K-token sequences with a 16GB model. On H200 (143GB), one process per GPU is safe, but if GPU memory is fragmented or the model is larger, LongBench should detect available memory and skip or use a smaller batch. Consider `max_length` tuning per gamma (lower gamma = more compression = smaller cache = can afford longer sequences).
+- [ ] **Run quick eval before LongBench by default.** The phased strategy should be the default, not an opt-in. Change the orchestrator's eval phase to always run quick first, then LongBench, without requiring `--eval-phase`. This ensures partial results are always available even if LongBench OOMs.
+- [ ] **Add a --max-gpu-memory flag to run_experiment.py.** Allow the user to cap GPU memory per process. When running LongBench, set this to 80% of total GPU memory to leave headroom for the KV cache.
+- [ ] **Clear stale state on phase transition.** When switching from one eval phase to another, clear `completed_evals` in `orchestrator_state.json` to avoid the queue-building bypass. Alternatively, track completed evals per phase: `"completed_evals_quick": [...]`, `"completed_evals_longbench": [...]`.
+
+### 22.6 Files Changed (Aug 29, 2026)
+
+| File | Change |
+|------|--------|
+| `src/run_experiment.py` | Added `--benchmarks` CLI arg; added `benchmarks` param to `run_evaluation()`; load existing results for merge when running partial benchmarks; guard each benchmark section with `if bench_name in run_benchmarks` |
+| `src/orchestrator.py` | Added `--eval-phase` CLI arg; added `is_eval_phase_complete()` function; pass `eval_benchmarks` to subprocess via `--benchmarks`; use `phase_check_fn` for queue building and completion; fixed queue bypass bug where `completed_evals` skipped phase-specific checks |
+| `scripts/relaunch.sh` | Accept and pass through CLI args; save/restore eval phase from `.eval_phase` file |
+| `scripts/watchdog.sh` | Read `.eval_phase` file and pass correct phase to relaunch |
