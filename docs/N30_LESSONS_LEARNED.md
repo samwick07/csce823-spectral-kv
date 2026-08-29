@@ -821,3 +821,48 @@ To safely run additional eval configs alongside the orchestrator:
 |------|--------|
 | `src/orchestrator.py` | Added `_is_eval_process_running()` helper; added pre-launch `phase_check_fn` re-check and process-existence check in batch dispatch loop; skip configs that completed or are already running since queue was built |
 | `src/run_experiment.py` | Changed all result JSON writes to atomic writes (temp file + `os.replace`); extracted `_atomic_write_json()` helper for reuse across `all_results.json` and per-benchmark JSONs |
+
+
+---
+
+## 24. WandB Crashed Status vs Valid On-Disk Results (OBSERVED Aug 29, 2026)
+
+### 24.1 Issue
+
+C02's WandB run shows a "crashed" status, but the LongBench evaluation is actually complete with valid results on disk. C03 (same run batch) shows as "complete" in WandB with identical data structure.
+
+**Root cause:** WandB marks a run as "crashed" when the Python process exits without calling `wandb.finish()`. During the Aug 28-29 incident (Section 22), the mass process cleanup killed eval processes externally (SIGKILL/SIGTERM). C02's eval process had already written valid results to `all_results.json` and `longbench.json`, but was killed before it reached the `finish_wandb()` call at the end of `run_evaluation()`. C03's process happened to complete the full pipeline including `wandb.finish()` before the cleanup.
+
+The on-disk JSON files are the source of truth. WandB run status is a process-lifecycle signal, not a data-integrity signal.
+
+### 24.2 Verification
+
+C02 on-disk results (verified Aug 29):
+- `all_results.json`: all 4 benchmark keys present, 0 errors
+- LongBench: 14 tasks, 200 samples each, all with real non-zero `all_scores` arrays
+- `overall_mean = 0.0207` (valid for DCT fixed gamma=0.22)
+- `longbench.json`: identical data to `all_results.json` longbench section
+
+C03 on-disk results (verified Aug 29):
+- Same structure, `overall_mean = 0.0483`
+- WandB status: "complete" (process finished cleanly)
+
+The `is_eval_phase_complete()` function correctly identifies C02 as complete because it validates the JSON files on disk, not WandB status.
+
+### 24.3 Why This Matters
+
+A WandB "crashed" status does not mean the evaluation data is invalid. It only means the WandB SDK did not perform its clean shutdown handshake. The actual evaluation work (model loading, benchmark execution, metric computation, file writing) may have completed successfully before the process was killed.
+
+Conversely, a WandB "complete" status does not guarantee valid on-disk results. A process could call `wandb.finish()` but fail to write `all_results.json` if an error occurred between metric computation and file save.
+
+### 24.4 Fix Applied
+
+No code fix needed for the current run — on-disk results are valid and `is_eval_phase_complete()` already checks disk, not WandB. However, the following hardening is needed for N=30.
+
+### 24.5 Remaining Hardening for N=30
+
+- [ ] **Add a `try/finally` block around `finish_wandb()` in `run_evaluation()`.** Currently, if the process is killed between writing results and calling `finish_wandb()`, WandB shows "crashed" even though results are valid. Wrap the entire evaluation in `try/finally` so `finish_wandb()` is called even on exceptions. For SIGKILL (uncatchable), document that on-disk results are authoritative.
+- [ ] **Add a WandB status reconciliation script.** After all evals complete, scan each config's on-disk results. If results are valid but the WandB run shows "crashed," log a `wandb.init(resume=...)` + `wandb.finish()` to mark the run as complete. This aligns WandB status with on-disk truth.
+- [ ] **Document on-disk results as the source of truth.** Add a comment in `src/orchestrator.py` near `is_eval_complete()` and `is_eval_phase_complete()` stating that on-disk JSON files are authoritative and WandB status is advisory only.
+- [ ] **Add a `results_verified` flag to orchestrator_state.json.** After each eval completes, set `results_verified: true` only after validating the JSON files (not just checking process exit code). This separates "process exited 0" from "results are valid JSON with all expected keys."
+- [ ] **Log a warning when WandB status disagrees with on-disk results.** If `is_eval_phase_complete()` returns True but the WandB run shows "crashed" or "failed," log a warning so the operator knows to reconcile the WandB status.
