@@ -245,6 +245,27 @@ def is_eval_phase_complete(
     except (json.JSONDecodeError, OSError):
         return False
 
+def _is_eval_process_running(config_id: str, seed: int) -> bool:
+    """Check if a run_experiment.py process for this config+seed is running.
+
+    Prevents duplicate eval processes when manual launches coexist with
+    the orchestrator, or when a watchdog restart re-queues already-running
+    configs.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "aux"],
+            capture_output=True, text=True, timeout=10,
+        )
+        for line in result.stdout.splitlines():
+            if "run_experiment" in line and config_id in line and f"seed {seed}" in line:
+                if "grep" not in line:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def get_phase2_checkpoint(config_id: str) -> str | None:
     """Get path to Phase 2 checkpoint if it exists."""
     ckpt = CHECKPOINT_DIR / config_id / "phase2_longalpaca" / "final"
@@ -746,6 +767,35 @@ def run_full_sweep(
                 # Launch all evals in this batch as parallel subprocesses
                 # Each entry: (config_id, seed, gpu_id, proc)
                 procs: list[tuple[str, int, int, subprocess.Popen]] = []
+
+                # Filter out configs that completed or are already running
+                # since the queue was built (e.g., manual parallel launches).
+                filtered_batch = []
+                for config_id, seed in batch:
+                    eval_key = f"{config_id}_seed{seed}"
+                    # Re-check phase completion (may have finished externally)
+                    if phase_check_fn(config_id, seed):
+                        logger.info(f"[{config_id} seed={seed}] Already complete "
+                                     f"(phase check), skipping.")
+                        if eval_key not in state["completed_evals"]:
+                            state["completed_evals"].append(eval_key)
+                            save_state(state)
+                        continue
+                    # Check for an already-running process for this config
+                    if _is_eval_process_running(config_id, seed):
+                        logger.info(f"[{config_id} seed={seed}] Eval process "
+                                     f"already running, skipping.")
+                        continue
+                    filtered_batch.append((config_id, seed))
+
+                if not filtered_batch:
+                    logger.info(f"  Batch {batch_num}/{total_batches}: all configs "
+                                f"already complete or running, skipping.")
+                    continue
+
+                batch = filtered_batch
+                logger.info(f"  Batch {batch_num}/{total_batches}: "
+                            f"{len(batch)} jobs to launch")
 
                 for gpu_id, (config_id, seed) in enumerate(batch):
                     task = f"eval_{config_id}_seed{seed}"

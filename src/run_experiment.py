@@ -308,24 +308,42 @@ def run_evaluation(
     results_dir.mkdir(parents=True, exist_ok=True)
 
     results_file = results_dir / "all_results.json"
-    with open(results_file, "w") as f:
-        # Convert numpy types for JSON serialization
-        def default_serializer(obj):
-            if isinstance(obj, (torch.Tensor)):
-                return obj.tolist() if obj.numel() < 1000 else f"Tensor{tuple(obj.shape)}"
-            if isinstance(obj, (float, int, str, bool, type(None))):
-                return obj
-            if isinstance(obj, list):
-                return obj
-            return str(obj)
-        json.dump(all_results, f, indent=2, default=default_serializer)
+
+    # Convert numpy types for JSON serialization
+    def default_serializer(obj):
+        if isinstance(obj, (torch.Tensor)):
+            return obj.tolist() if obj.numel() < 1000 else f"Tensor{tuple(obj.shape)}"
+        if isinstance(obj, (float, int, str, bool, type(None))):
+            return obj
+        if isinstance(obj, list):
+            return obj
+        return str(obj)
+
+    # Atomic write: write to temp file, then rename (prevents corruption
+    # if two processes ever write the same file concurrently).
+    import tempfile
+    def _atomic_write_json(path, data):
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), suffix=".tmp", prefix=path.stem
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2, default=default_serializer)
+            os.replace(tmp_path, str(path))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    _atomic_write_json(results_file, all_results)
 
     # Also save individual benchmark results
     for benchmark_name in ["pg19", "proof_pile", "longbench", "efficiency"]:
         if benchmark_name in all_results:
             bench_file = results_dir / f"{benchmark_name}.json"
-            with open(bench_file, "w") as f:
-                json.dump(all_results[benchmark_name], f, indent=2, default=default_serializer)
+            _atomic_write_json(bench_file, all_results[benchmark_name])
 
     logger.info(f"Results saved to {results_dir}")
 
