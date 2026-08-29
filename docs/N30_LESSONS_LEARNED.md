@@ -721,3 +721,103 @@ Phase B (LongBench):
 | `src/orchestrator.py` | Added `--eval-phase` CLI arg; added `is_eval_phase_complete()` function; pass `eval_benchmarks` to subprocess via `--benchmarks`; use `phase_check_fn` for queue building and completion; fixed queue bypass bug where `completed_evals` skipped phase-specific checks |
 | `scripts/relaunch.sh` | Accept and pass through CLI args; save/restore eval phase from `.eval_phase` file |
 | `scripts/watchdog.sh` | Read `.eval_phase` file and pass correct phase to relaunch |
+
+
+---
+
+## 23. Safe Multi-Config Parallel Eval (Manual GPU Sharing) (FIXED Aug 29, 2026)
+
+### 23.1 Opportunity
+
+LongBench evaluation is GPU-memory-bound, not GPU-compute-bound. During autoregressive generation (one token at a time, K=1 decoding), GPU utilization sits at 30-50% for compressed configs and 40-44% for the baseline. Meanwhile, each H200 has 143GB of memory, and a compressed config uses only ~19-21GB (model + small KV cache). This leaves 100+ GB of headroom per GPU.
+
+The orchestrator's default dispatch is one process per GPU, one batch at a time. For 11 LongBench configs on 4 GPUs, this means 3 sequential batches at ~12 hours each = ~36 hours wall-clock. By manually launching additional configs on GPUs with spare memory, all 11 can run simultaneously, reducing wall-clock to ~12-15 hours.
+
+### 23.2 Risk Assessment
+
+The previous incident (Section 22) showed that running multiple processes per GPU can cause OOM kills during LongBench. The key difference between the safe and unsafe scenarios:
+
+**Unsafe (Aug 28 incident):** 2-3 processes per GPU, each running ALL 4 benchmarks including LongBench. The baseline config (C00) has an uncompressed KV cache that grows to 40+ GB during 16K-token generation. Three baselines sharing a GPU = 120+ GB, leaving no headroom for the KV cache to grow during generation. Result: OOM kills.
+
+**Safe (Aug 29 fix):** 2-3 processes per GPU, each running ONLY LongBench. Compressed configs (gamma 0.01-0.50) have spectrally compressed KV caches that stay small even during long generation. Memory budget per GPU:
+
+| GPU | Configs | Total Memory | Free | Headroom |
+|-----|---------|-------------|------|----------|
+| 0   | C00 (41GB) + C09 (21GB) | 62GB | 81GB | Safe: C00 KV cache maxes ~41GB, C09 (gamma=0.01) adds ~21GB |
+| 1   | C01 (19GB) + C04 (19GB) + C08 (21GB) | 59GB | 84GB | All compressed, KV caches stay small |
+| 2   | C05 (18GB) + C07 (21GB) + C11 (18GB) | 58GB | 85GB | All compressed |
+| 3   | C06 (18GB) + C10 (19GB) + C12 (18GB) | 54GB | 89GB | All compressed |
+
+The baseline (C00) is the only config with a large KV cache. It gets its own GPU paired with only one compressed config (C09, gamma=0.01, minimal KV cache).
+
+### 23.3 Conflict Scenarios and Fixes
+
+Running manual eval processes alongside the orchestrator introduces three conflict scenarios. All three are now patched.
+
+**Scenario 1: Orchestrator launches duplicate processes.**
+
+The orchestrator builds its eval_queue once at startup. When batch 1 finishes, it blindly takes the next batch from the queue and launches new subprocesses — even if those configs are already running manually. This would put 2 model instances for the same config on the same GPU, risking OOM.
+
+**Fix:** Added a pre-launch re-check in the batch dispatch loop (`src/orchestrator.py`). Before launching each config, the orchestrator now:
+1. Re-runs `phase_check_fn()` — if the config completed since the queue was built (by a manual process), it is marked complete and skipped.
+2. Calls `_is_eval_process_running(config_id, seed)` — scans `ps aux` for an existing `run_experiment.py` process with the same config ID and seed. If found, the config is skipped.
+
+This makes the orchestrator safe to run alongside manual launches: it will detect configs that are already running or already complete and skip them.
+
+**Scenario 2: File write race on all_results.json.**
+
+If two processes for the same config finish around the same time, both open `all_results.json` in `"w"` mode. One could truncate the file while the other is mid-write, producing corrupt JSON.
+
+**Fix:** Changed all result JSON writes in `src/run_experiment.py` to atomic writes: write to a temp file in the same directory, then `os.replace()` (atomic on POSIX). This guarantees that `all_results.json` is always either the old version or the new version, never a half-written file.
+
+**Scenario 3: Watchdog restart re-queues running configs.**
+
+If the orchestrator dies and the watchdog restarts it, the new orchestrator builds a fresh eval_queue. Configs still running manually would not have results yet, so `phase_check_fn` would return False and the orchestrator would launch duplicates.
+
+**Fix:** The `_is_eval_process_running()` check (from Scenario 1) handles this. Even if `phase_check_fn` returns False (results not yet written), the process-existence check will detect the running manual process and skip it.
+
+### 23.4 Verification
+
+After launching 7 additional configs manually (3 on GPU 1, 3 on GPU 2, 3 on GPU 3, 1 on GPU 0):
+- All 11 processes running, 0 crashes
+- GPU utilization: 92-94% across all 4 GPUs (up from 38%)
+- GPU memory: 54-62 GB per GPU (38-44% of 143GB), 80+ GB headroom on every GPU
+- All configs actively generating LongBench tokens
+- Orchestrator (batch 1) still running — when it finishes and tries batch 2, the pre-launch re-checks will detect the manual processes and skip them
+
+### 23.5 Safe Multi-Config Parallel Eval Procedure
+
+To safely run additional eval configs alongside the orchestrator:
+
+1. **Check GPU memory headroom.** Run `nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv`. Each additional compressed config needs ~20GB. Leave 30+ GB headroom for KV cache growth.
+
+2. **Pair by gamma level.** Put high-gamma configs (0.50, larger KV cache) with low-gamma configs (0.01, tiny KV cache) on the same GPU. Never put two baseline (C00) configs on the same GPU.
+
+3. **Launch with explicit CUDA_VISIBLE_DEVICES.** Set the GPU ID explicitly so the process lands on the intended GPU:
+   ```
+   CUDA_VISIBLE_DEVICES=<gpu_id> nohup .venv/bin/python src/run_experiment.py \
+     --config configs/experiment_C<XX>.yaml --mode eval --seed 0 \
+     --benchmarks longbench \
+     --checkpoint checkpoints/C<XX>/phase2_longalpaca/final \
+     --hf-token "$HF_TOKEN" \
+     > logs/eval_longbench_C<XX>_gpu<gpu_id>.log 2>&1 &
+   ```
+
+4. **Verify no OOM.** After 30 seconds, check `nvidia-smi` for memory usage. If any GPU is above 120GB, kill the most recently launched process on that GPU.
+
+5. **Monitor.** The orchestrator's pre-launch re-checks will prevent duplicate launches. Manual processes write results atomically. When the orchestrator reaches those configs in its queue, they will be skipped.
+
+### 23.6 Remaining Hardening for N=30
+
+- [ ] **Add a `--max-configs-per-gpu` flag to the orchestrator.** Instead of hardcoding 1 process per GPU, allow the orchestrator to launch 2-3 configs per GPU when memory permits. The orchestrator would check `nvidia-smi` for free memory before launching each subprocess and assign to the GPU with the most headroom.
+- [ ] **Add GPU memory monitoring to the eval launch loop.** Before launching each subprocess, query the GPU's free memory. If less than 25GB is free, skip that GPU for this batch. This prevents OOM without hardcoding GPU assignments.
+- [ ] **Make the orchestrator aware of externally-launched processes.** Instead of a `ps aux` scan, use a shared "running evals" file (e.g., `results/running_evals.json`) that both the orchestrator and manual launches read/write. Each process registers its config_id, seed, GPU, and PID on start, and removes the entry on completion. This is more reliable than process scanning and works across pod restarts.
+- [ ] **Add a memory budget per gamma level.** Document the expected memory usage per config: baseline (~41GB), gamma=0.50 (~20GB), gamma=0.22 (~19GB), gamma=0.01 (~18GB). Use these to compute safe GPU packing before launch.
+- [ ] **Add a deadlock detector.** If the orchestrator's eval queue is non-empty but all remaining configs are "already running" (via `_is_eval_process_running`), and none have completed in the last 2 hours, alert. This could indicate a stalled manual process that will never write results, leaving the orchestrator waiting forever.
+
+### 23.7 Files Changed (Aug 29, 2026)
+
+| File | Change |
+|------|--------|
+| `src/orchestrator.py` | Added `_is_eval_process_running()` helper; added pre-launch `phase_check_fn` re-check and process-existence check in batch dispatch loop; skip configs that completed or are already running since queue was built |
+| `src/run_experiment.py` | Changed all result JSON writes to atomic writes (temp file + `os.replace`); extracted `_atomic_write_json()` helper for reuse across `all_results.json` and per-benchmark JSONs |
