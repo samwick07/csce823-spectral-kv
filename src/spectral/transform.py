@@ -1,23 +1,32 @@
 """Spectral transforms for KV-cache compression.
 
+Implements the frequency-domain compression from FreqKV (arXiv:2505.00570, ICLR 2026),
+extended with a complex FFT variant and learnable spectral filtering.
+
 Two transforms are provided:
-  - DCTTransform: Discrete Cosine Transform (FreqKV baseline). Real-valued,
-    discards phase information.
-  - FFTTransform: Complex-valued Fast Fourier Transform. Preserves phase.
+  - DCTTransform: Discrete Cosine Transform (DCT-II) with ortho normalization.
+    Real-valued, discards phase information. This is the FreqKV baseline.
+  - FFTTransform: Complex-valued Fast Fourier Transform (rfft/irfft).
+    Preserves phase. Novel contribution beyond FreqKV.
 
 Both operate along the sequence dimension of key/value tensors.
+The compression flow is:
+  1. Transform the KV tensor into the spectral domain.
+  2. Apply the spectral filter (learnable mask or no-op for fixed).
+  3. Truncate to retain only compress_len coefficients.
+  4. Inverse transform back to the spatial domain (at reduced length).
+  5. Scale by sqrt(compress_len / original_len) to compensate for the
+     amplitude change when going from N to L samples in the ortho-normalized
+     DCT/IDCT pair.
 
-The FreqKV approach (arXiv:2505.00570, ICLR 2026):
-  1. Transform the KV cache into the spectral domain.
-  2. Truncate to retain only the lowest-frequency gamma fraction.
-  3. Store the compressed spectral representation as the cache.
-  4. Reconstruct to the spatial domain only when attention needs to
-     compute Q @ K^T.
-
-This gives a true O(gamma * N) cache size instead of O(N).
+This gives a compressed tensor of length compress_len (NOT original_len with
+lossy reconstruction). The compressed "tokens" represent the low-frequency
+structure of the original tokens at reduced resolution.
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn as nn
@@ -25,7 +34,11 @@ from abc import ABC, abstractmethod
 
 
 class SpectralTransform(ABC, nn.Module):
-    """Base class for spectral transforms applied to KV-cache tensors."""
+    """Base class for spectral transforms applied to KV-cache tensors.
+
+    Provides the common compress() flow. Subclasses implement forward(),
+    inverse(), truncate(), and spectral_len().
+    """
 
     def __init__(self, dim: int = -2):
         """
@@ -84,26 +97,92 @@ class SpectralTransform(ABC, nn.Module):
         """Zero-pad spectral coefficients to a target length (for batch operations)."""
         ...
 
+    def compress(
+        self,
+        x: torch.Tensor,
+        compress_len: int,
+        filter_fn=None,
+        gamma: float = 0.5,
+    ) -> torch.Tensor:
+        """Compress x from length N to length compress_len in the spectral domain.
+
+        This is the core compression method, following FreqKV's dct_compress:
+          1. Transform to spectral domain (forward).
+          2. Apply learnable filter (if provided) on the FULL spectrum.
+          3. Truncate to compress_len coefficients.
+          4. Inverse transform to spatial domain at length compress_len.
+          5. Scale by sqrt(compress_len / original_len).
+
+        The filter is applied BEFORE truncation (Q13 decision): the filter sees
+        the full spectrum and can learn to retain high-frequency components that
+        truncation would discard. Truncation then enforces the compression budget.
+
+        Args:
+            x: Input tensor [B, H, N, D] where N is the sequence length.
+            compress_len: Target compressed length L (L < N).
+            filter_fn: Optional callable(x_spectral, gamma) -> filtered spectral.
+                       If None, no filtering (fixed low-pass via truncation only).
+            gamma: Target compression ratio (used by filter for regularization).
+
+        Returns:
+            Compressed tensor [B, H, L, D] where L = compress_len.
+        """
+        seq_len = x.shape[self.dim]
+
+        # No compression needed
+        if compress_len >= seq_len:
+            return x
+
+        # No compression for empty
+        if compress_len == 0:
+            shape = list(x.shape)
+            shape[self.dim] = 0
+            return torch.empty(shape, device=x.device, dtype=x.dtype)
+
+        # 1. Transform to spectral domain
+        x_spectral = self.forward(x)
+
+        # 2. Apply learnable filter on FULL spectrum (before truncation)
+        if filter_fn is not None:
+            x_spectral = filter_fn(x_spectral, gamma)
+
+        # 3. Truncate to compress_len coefficients
+        x_spectral = self.truncate(x_spectral, compress_len / max(seq_len, 1))
+        # Ensure exactly compress_len
+        current_len = x_spectral.shape[self.dim]
+        if current_len > compress_len:
+            x_spectral = x_spectral.narrow(
+                self.dim if self.dim >= 0 else x_spectral.ndim + self.dim,
+                0, compress_len
+            )
+
+        # 4. Inverse transform to spatial domain at compressed length
+        x_compressed = self.inverse(x_spectral, compress_len)
+
+        # 5. Scale by sqrt(L / N) to compensate for amplitude change
+        scale = math.sqrt(compress_len / seq_len)
+        x_compressed = x_compressed * scale
+
+        return x_compressed
+
 
 class DCTTransform(SpectralTransform):
-    """Discrete Cosine Transform (DCT-II) for KV-cache compression.
+    """Discrete Cosine Transform (DCT-II) with ortho normalization.
 
-    This is the FreqKV baseline transform. The DCT is real-valued and
-    discards phase information. Implemented via a manual FFT-based DCT algorithm.
+    This is the FreqKV baseline transform. Uses ortho-normalized DCT/IDCT
+    via the standard FFT-based interleaving trick.
 
     The DCT produces N real coefficients for a length-N input. After
-    truncation to gamma*N coefficients, the inverse DCT must zero-pad
-    back to N coefficients before reconstructing.
+    truncation to L coefficients, the inverse DCT produces a length-L
+    output that is the best low-pass approximation of the input.
 
-    Fix 4: DCT index/phase tensors are precomputed and cached as
-    non-persistent buffers keyed by (N, device) to avoid recomputing
-    them on every forward/inverse call.
+    Constants (permutation indices, phase factors) are precomputed and
+    cached per (N, device) to avoid recomputation.
     """
 
     def __init__(self, dim: int = -2):
         super().__init__(dim=dim)
-        # Cache for precomputed tensors: {(N, device): (perm, phase, mirror_idx)}
-        # These are NOT nn buffers (they vary by N); they are memoized per-call.
+        # Cache for precomputed tensors: {(N, device, dtype): (constants)}
         self._fwd_cache: dict = {}
         self._inv_cache: dict = {}
 
@@ -111,29 +190,33 @@ class DCTTransform(SpectralTransform):
         """Get or precompute forward DCT constants for length N.
 
         Returns:
-            (perm, phase) where:
+            (perm, phase, norm_factors) where:
               perm: interleaving permutation indices [N]
               phase: DCT-II phase factors [N] (complex)
+              norm_factors: ortho normalization [N]
         """
         key = (N, str(device))
         if key not in self._fwd_cache:
             even_idx = torch.arange(0, N, 2, device=device)
             odd_idx = torch.arange(1, N, 2, device=device)
             perm = torch.cat([even_idx, odd_idx.flip(0)])
-            k = torch.arange(N, device=device, dtype=dtype)
+
+            k = torch.arange(N, device=device, dtype=torch.float32)
             phase = torch.exp(-1j * torch.pi * k / (2 * N))
-            self._fwd_cache[key] = (perm, phase)
+
+            # Ortho normalization factors
+            norm = torch.ones(N, device=device, dtype=torch.float32)
+            norm[0] = 1.0 / (math.sqrt(N) * 2)
+            norm[1:] = 1.0 / (math.sqrt(N / 2) * 2)
+
+            self._fwd_cache[key] = (perm, phase, norm)
         return self._fwd_cache[key]
 
     def _get_inv_constants(self, N: int, device: torch.device, dtype: torch.dtype):
         """Get or precompute inverse DCT constants for length N.
 
         Returns:
-            (mirror_idx, phase, even_idx, odd_idx) where:
-              mirror_idx: mirror permutation for Hermitian reconstruction [N]
-              phase: inverse DCT phase factors [N] (complex)
-              even_idx: even indices for de-interleaving [N//2 or (N+1)//2]
-              odd_idx: odd indices for de-interleaving [N//2]
+            (mirror_idx, phase, norm_factors, even_idx, odd_idx)
         """
         key = (N, str(device))
         if key not in self._inv_cache:
@@ -141,22 +224,29 @@ class DCTTransform(SpectralTransform):
                 torch.zeros(1, dtype=torch.long, device=device),
                 torch.arange(N - 1, 0, -1, device=device),
             ])
-            k = torch.arange(N, device=device, dtype=dtype)
+
+            k = torch.arange(N, device=device, dtype=torch.float32)
             phase = torch.exp(1j * torch.pi * k / (2 * N))
+
+            # Ortho denormalization factors
+            norm = torch.ones(N, device=device, dtype=torch.float32)
+            norm[0] = math.sqrt(N) * 2
+            norm[1:] = math.sqrt(N / 2) * 2
+
             even_idx = torch.arange(0, N, 2, device=device)
             odd_idx = torch.arange(1, N, 2, device=device)
-            self._inv_cache[key] = (mirror_idx, phase, even_idx, odd_idx)
+
+            self._inv_cache[key] = (mirror_idx, phase, norm, even_idx, odd_idx)
         return self._inv_cache[key]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply DCT-II along the sequence dimension.
+        """Apply DCT-II with ortho normalization along the sequence dimension.
 
         Uses the standard interleaving trick to compute DCT-II via FFT.
         Returns N real coefficients for a length-N input.
 
         The interleaving permutation v = [x_0, x_2, ..., x_{N-1},
-        x_{N-2}, ..., x_1] is applied via index_select along self.dim
-        (NOT ``x[..., 0::2]`` which would slice the last dimension).
+        x_{N-2}, ..., x_1] is applied via index_select along self.dim.
         """
         N = x.shape[self.dim]
         dim = self.dim if self.dim >= 0 else x.ndim + self.dim
@@ -166,8 +256,7 @@ class DCTTransform(SpectralTransform):
         if orig_dtype != torch.float32:
             x = x.to(torch.float32)
 
-        # Use precomputed constants (Fix 4)
-        perm, phase = self._get_fwd_constants(N, x.device, x.dtype)
+        perm, phase, norm = self._get_fwd_constants(N, x.device, x.dtype)
 
         v = x.index_select(dim, perm)
 
@@ -178,42 +267,29 @@ class DCTTransform(SpectralTransform):
         shape = [1] * x.ndim
         shape[dim] = N
         phase = phase.reshape(shape)
+        norm = norm.reshape(shape)
 
-        dct = (V * phase).real
+        dct = (V * phase).real * norm * 2
 
-        # Restore original dtype (BFloat16 etc.)
+        # Restore original dtype
         if orig_dtype != torch.float32:
             dct = dct.to(orig_dtype)
         return dct
 
     def inverse(self, x_spectral: torch.Tensor, target_len: int) -> torch.Tensor:
-        """Apply inverse DCT (DCT-III) to reconstruct the spatial tensor.
+        """Apply inverse DCT (DCT-III) with ortho normalization.
 
         If x_spectral has been truncated to fewer coefficients than
         target_len, we zero-pad back to target_len before applying the
-        inverse.
+        inverse. The output has length target_len.
 
-        The forward DCT-II computes X_k = Re(W_k) where
-        W_k = exp(-j*pi*k/(2N)) * FFT(v)_k and v is the interleaved
-        permutation of x.  Since v is real, FFT(v) has Hermitian
-        symmetry, which constrains the imaginary part of W_k:
-
-            Im(W_k) = -X_{N-k}   for k = 1 .. N-1
-            Im(W_0) = 0
-
-        So W_k = X_k - j*X_{N-k} (with X_mirror[0]=0), and we recover
-        v = IFFT(W * exp(j*pi*k/(2N))) which is guaranteed real by the
-        Hermitian symmetry of the reconstructed spectrum.  No X_0
-        scaling or 2x factor is needed — this is an exact
-        reconstruction, not the normalized DCT-III formula.
-
-        Args:
-            x_spectral: Spectral representation (possibly truncated).
-            target_len: Original sequence length for reconstruction.
+        Uses Hermitian symmetry reconstruction from real DCT coefficients:
+            W_k = X_k - j*X_{N-k}  (with X_mirror[0]=0)
+        Then v = IFFT(W * exp(j*pi*k/(2N))) which is guaranteed real.
         """
         current_len = x_spectral.shape[self.dim]
 
-        # torch.fft doesn't support BFloat16 — cast to float32, restore after
+        # torch.fft doesn't support BFloat16 — cast to float32
         orig_dtype = x_spectral.dtype
         if orig_dtype != torch.float32:
             x_spectral = x_spectral.to(torch.float32)
@@ -221,7 +297,8 @@ class DCTTransform(SpectralTransform):
         # Zero-pad spectral coefficients back to target_len if truncated
         if current_len < target_len:
             pad_shape = list(x_spectral.shape)
-            pad_shape[self.dim] = target_len - current_len
+            dim = self.dim if self.dim >= 0 else x_spectral.ndim + self.dim
+            pad_shape[dim] = target_len - current_len
             padding = torch.zeros(pad_shape, device=x_spectral.device, dtype=x_spectral.dtype)
             x_spectral = torch.cat([x_spectral, padding], dim=self.dim)
         elif current_len > target_len:
@@ -230,24 +307,27 @@ class DCTTransform(SpectralTransform):
         N = target_len
         dim = self.dim if self.dim >= 0 else x_spectral.ndim + self.dim
 
-        # Use precomputed constants (Fix 4)
-        mirror_idx, phase, even_idx, odd_idx = self._get_inv_constants(
+        mirror_idx, phase, norm, even_idx, odd_idx = self._get_inv_constants(
             N, x_spectral.device, x_spectral.dtype
         )
 
+        # Apply denormalization
+        shape = [1] * x_spectral.ndim
+        shape[dim] = N
+        norm = norm.reshape(shape)
+        X_v = x_spectral / 2 * norm
+
         # Build the mirror index: X_mirror[k] = X_{N-k} for k=1..N-1, 0 for k=0
-        X_mirror = x_spectral.index_select(dim, mirror_idx)
+        X_mirror = X_v.index_select(dim, mirror_idx)
         # Zero out position 0 (Im(W_0) = 0)
         zero_sel = [slice(None)] * x_spectral.ndim
         zero_sel[dim] = 0
         X_mirror[tuple(zero_sel)] = 0
 
         # Reconstruct complex spectrum: W = X - j * X_mirror
-        W = torch.complex(x_spectral, -X_mirror)
+        W = torch.complex(X_v, -X_mirror)
 
         # Apply phase: V = W * exp(j*pi*k/(2N))
-        shape = [1] * x_spectral.ndim
-        shape[dim] = N
         phase = phase.reshape(shape)
         V = W * phase
 
@@ -266,7 +346,7 @@ class DCTTransform(SpectralTransform):
         x[tuple(even_sel)] = v_first.real
         x[tuple(odd_sel)] = v_second.real.flip(dim)
 
-        # Restore original dtype (BFloat16 etc.)
+        # Restore original dtype
         if orig_dtype != torch.float32:
             x = x.to(orig_dtype)
         return x
@@ -300,10 +380,11 @@ class FFTTransform(SpectralTransform):
     """Complex-valued Fast Fourier Transform for KV-cache compression.
 
     Unlike the DCT, the complex FFT preserves phase information.
-    The full proposed method uses this transform.
+    This is the project's novel contribution beyond FreqKV.
 
     Uses rfft/irfft for real-valued input, which returns N//2+1 complex
-    coefficients for a length-N input.
+    coefficients for a length-N input. After truncation, irfft reconstructs
+    to the target length.
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -323,7 +404,7 @@ class FFTTransform(SpectralTransform):
 
         Args:
             x_spectral: Truncated spectral representation from rfft.
-            target_len: Original sequence length for irfft reconstruction.
+            target_len: Target sequence length for irfft reconstruction.
         """
         # torch.fft doesn't support BFloat16 — cast to float32
         orig_dtype = x_spectral.dtype
