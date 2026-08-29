@@ -14,19 +14,19 @@ while true; do
             continue
         fi
     fi
-    
+
     if [ -f "$PROJECT_ROOT/results/orchestrator_state.json" ]; then
         COMPLETED=$(python3 -c "
 import json
-with open(/results/orchestrator_state.json) as f:
+with open('$PROJECT_ROOT/results/orchestrator_state.json') as f:
     s = json.load(f)
-training = len(s.get(completed_training, []))
-analysis = s.get(completed_analysis, False)
-exfil = s.get(completed_exfil, False)
+training = len(s.get('completed_training', []))
+analysis = s.get('completed_analysis', False)
+exfil = s.get('completed_exfil', False)
 done = training >= 13 and analysis and exfil
-print(false if done else true)
+print('false' if done else 'true')
 " 2>/dev/null)
-        
+
         if [ "$COMPLETED" = "true" ]; then
             echo "[$(date)] Orchestrator not running but work remains. Restarting..."
             cd "$PROJECT_ROOT"
@@ -41,6 +41,6 @@ print(false if done else true)
             fi
         fi
     fi
-    
+
     sleep $POLL_INTERVAL
 done
