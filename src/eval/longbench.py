@@ -74,7 +74,7 @@ def evaluate_longbench(
         longbench_dir: Path to LongBench evaluation code (for metrics).
         num_samples: If set, evaluate only the first N samples per task
                      (useful for smoke tests). None = full dataset.
-        past_key_value: Optional SpectralDynamicCache for incremental
+        past_key_value: Optional DynamicCache for KV caching during
                         KV caching during generation. If provided,
                         enables K=1 incremental updates (O(N log N) per
                         step instead of O(N^2)).

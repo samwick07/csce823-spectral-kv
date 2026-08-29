@@ -28,3 +28,7 @@ experiment_name: baseline
 transform_type: none
 filter_type: none
 gamma: 1.0
+sink_size: 4
+recent_size: 8
+cache_size: 8192
+use_flash_attn: true

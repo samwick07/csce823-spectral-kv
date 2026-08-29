@@ -28,3 +28,7 @@ experiment_name: fft_learn_g050
 transform_type: fft
 filter_type: learnable
 gamma: 0.5
+sink_size: 4
+recent_size: 8
+cache_size: 8192
+use_flash_attn: true

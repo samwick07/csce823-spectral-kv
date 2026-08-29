@@ -59,19 +59,23 @@ def compute_sliding_window_perplexity(
     window_size: int = 256,
     stride: int | None = None,
     device: str = "cuda",
+    seq_len: int = 2048,
 ) -> float:
-    """Compute perplexity using a sliding window approach.
+    """Compute perplexity using seq_len-sized chunks with sliding windows within.
 
-    Following the protocol: sliding window of 256 tokens.
-    This evaluates the model's perplexity on long texts by processing
-    overlapping windows and averaging the negative log-likelihood.
+    Following FreqKV's evaluation protocol: process the text in seq_len-sized
+    chunks (not window_size-sized). This ensures compression is active during
+    evaluation when seq_len > cache_size. Within each chunk, loss is computed
+    on window_size sliding windows.
 
     Args:
         model: The language model.
         input_ids: Token IDs [1, seq_len] or [seq_len].
-        window_size: Size of the sliding window (default 256).
+        window_size: Size of the sliding window for loss computation (default 256).
         stride: Step size between windows. Defaults to window_size (no overlap).
         device: Device to run on.
+        seq_len: Chunk size for processing. Must be >= cache_size for compression
+                 to activate. Default 2048.
 
     Returns:
         Average perplexity across all windows.
@@ -86,7 +90,7 @@ def compute_sliding_window_perplexity(
     total_loss = 0.0
     total_tokens = 0
 
-    seq_len = input_ids.shape[1]
+    full_len = input_ids.shape[1]
 
     # Import here to avoid circular import
     try:
@@ -96,30 +100,37 @@ def compute_sliding_window_perplexity(
         has_spectral = False
 
     with torch.no_grad():
-        for start in range(0, seq_len - window_size + 1, stride):
-            end = start + window_size
-            window = input_ids[:, start:end].to(device)
+        # Process in seq_len-sized chunks
+        for chunk_start in range(0, full_len - window_size + 1, seq_len):
+            chunk_end = min(chunk_start + seq_len, full_len)
+            chunk = input_ids[:, chunk_start:chunk_end].to(device)
 
-            # Reset spectral caches between windows so each window
-            # is compressed independently (no cross-window cache leakage)
+            if chunk.shape[1] < window_size:
+                continue
+
+            # Reset spectral caches between chunks
             if has_spectral:
                 reset_all_caches(model)
 
-            outputs = model(window)
+            # Forward pass on the full chunk (compression active if seq_len > cache_size)
+            outputs = model(chunk)
             logits = outputs.logits
 
-            # Compute loss for this window
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = window[..., 1:].contiguous()
+            # Compute loss on sliding windows within the chunk
+            for win_start in range(0, chunk.shape[1] - window_size + 1, stride):
+                win_end = win_start + window_size
 
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                reduction="sum",
-            )
+                shift_logits = logits[:, win_start:win_end - 1, :].contiguous()
+                shift_labels = chunk[:, win_start + 1:win_end, :].contiguous()
 
-            total_loss += loss.item()
-            total_tokens += (end - start - 1)
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    reduction="sum",
+                )
+
+                total_loss += loss.item()
+                total_tokens += (win_end - win_start - 1)
 
     avg_loss = total_loss / max(total_tokens, 1)
     return math.exp(avg_loss)
@@ -139,7 +150,7 @@ def compute_efficiency_metrics(
         input_ids: Prompt token IDs [1, prompt_len].
         generate_length: Number of tokens to generate for latency measurement.
         device: Device to run on.
-        past_key_value: Optional SpectralDynamicCache for incremental KV caching.
+        past_key_value: Optional DynamicCache for KV caching during generation.
 
     Returns:
         EfficiencyMetrics with measured values.
