@@ -462,3 +462,151 @@ Setting `pad_token_id` to `eos_token_id`:128001 for open-end generation.
 22. Eval launches staggered by 30s to avoid memory spikes
 23. Eval result verification (JSON exists, valid, all 4 benchmark keys present)
 24. GitHub push script wired into orchestrator post-exfil
+25. Incremental metrics capture implemented (Section 21)
+
+---
+
+## 21. Resilient Metrics Capture
+
+### 21.1 Problem Statement
+
+During the N=1 run, training time, memory efficiency, compression overhead, and token latency data were only available from two sources:
+
+1. **WandB's `train_runtime` summary** -- written once at the end of training. If a config crashed mid-phase and resumed from checkpoint (as C00 did 19 times, and C11 did after pod eviction), the runtime metric only reflects the final successful segment, not the total wall-clock cost including crash/recovery overhead.
+
+2. **The efficiency benchmark** (`src/eval/efficiency.py`) -- runs last in the eval pipeline, after PG-19, Proof-pile, and LongBench. If any earlier benchmark crashes (as happened for all 12 compressed configs due to the `past_key_value` bug), the efficiency benchmark never runs and zero efficiency data is captured.
+
+**The consequence:** For the N=1 run, only C00 (baseline) has efficiency data. All 12 compressed configs have no memory, latency, or overhead measurements. Training time data for C00 is fragmented across 19 crash/restart cycles and cannot be reliably reconstructed. C11's Phase 2 runtime (3.13h) reflects only the post-eviction resume, not the full training cost including the 638 steps lost to the pod eviction.
+
+For N=30 (390 training runs, 780 phases), this problem scales dramatically. Any crash, eviction, or kill that interrupts a run before the efficiency benchmark destroys irreplaceable efficiency data that cannot be reconstructed from checkpoints alone.
+
+### 21.2 Required Metrics
+
+The following metrics must be captured for every `(config, phase, seed)` combination, regardless of whether the run completes successfully:
+
+**Training metrics (per phase):**
+- `phase`: 1 (RedPajama CPT) or 2 (LongAlpaca SFT)
+- `start_time`: ISO timestamp when training began
+- `end_time`: ISO timestamp when training ended (or was interrupted)
+- `wall_clock_seconds`: end_time - start_time (includes crash/recovery gaps for resumed runs)
+- `train_runtime_seconds`: HuggingFace Trainer's `train_runtime` (compute time only, excludes gaps)
+- `steps_completed`: number of optimizer steps that ran
+- `steps_total`: expected total steps for this phase
+- `train_loss_final`: final training loss
+- `gpu_memory_peak_gb`: peak GPU memory during training (per GPU)
+- `gpu_count`: number of GPUs used
+- `deep_speed_config`: which DS config was used (standard vs longctx)
+- `interrupted`: bool -- was this run killed/crashed before completion?
+- `interrupt_reason`: "pod_eviction", "oom", "manual_kill", "crash", or null
+- `checkpoint_resumed_from`: path to checkpoint if resumed, or null
+
+**Evaluation metrics (per benchmark, per config):**
+- `benchmark`: "pg19", "proof_pile", "longbench", "efficiency"
+- `start_time` / `end_time`: ISO timestamps
+- `wall_clock_seconds`: benchmark duration
+- `completed`: bool -- did this benchmark finish?
+- `error`: error message if benchmark failed, or null
+- `gpu_memory_peak_gb`: peak GPU memory during this benchmark
+- `gpu_id`: which GPU was assigned
+
+**Efficiency-specific metrics (when efficiency benchmark runs):**
+- `peak_kv_memory_gb`: peak KV-cache memory usage
+- `decoding_latency_ms_per_token`: milliseconds per token during generation
+- `compression_overhead_pct`: percentage overhead from spectral transform/reconstruct
+- `total_decode_time_s`: total wall-clock time for generation
+- `num_tokens_generated`: number of tokens in the generation test
+- `theoretical_cache_size_gb`: expected cache size = gamma * baseline_cache_size
+- `actual_cache_size_gb`: measured cache size from SpectralDynamicCache
+- `cache_compression_ratio`: actual / theoretical (should be ~1.0)
+
+### 21.3 Design: Incremental Metrics File
+
+**Principle:** Write metrics to a persistent JSON file incrementally, after each benchmark completes -- not only at the end of the full eval pipeline. This ensures partial data survives crashes.
+
+**File location:** `results/raw/{config_id}/seed_{seed}/metrics.json`
+
+**Structure:**
+```json
+{
+  "config_id": "C01",
+  "seed": 0,
+  "transform_type": "dct",
+  "filter_type": "fixed",
+  "gamma": 0.5,
+  "training": {
+    "phase1": {
+      "start_time": "2026-08-22T19:11:19Z",
+      "end_time": "2026-08-22T19:41:01Z",
+      "wall_clock_seconds": 1782,
+      "train_runtime_seconds": null,
+      "steps_completed": 500,
+      "steps_total": 1000,
+      "train_loss_final": null,
+      "interrupted": true,
+      "interrupt_reason": "crash",
+      "checkpoint_resumed_from": null,
+      "attempts": [
+        {"start": "...", "end": "...", "steps": 500, "reason": "crash"},
+        {"start": "...", "end": "...", "steps": 1000, "reason": null}
+      ]
+    },
+    "phase2": { ... }
+  },
+  "evaluation": {
+    "pg19": {
+      "start_time": "...",
+      "end_time": "...",
+      "wall_clock_seconds": 320,
+      "completed": true,
+      "result": {"mean_perplexity": 1.12},
+      "gpu_memory_peak_gb": 19.3,
+      "gpu_id": 0
+    },
+    "proof_pile": { ... },
+    "longbench": {
+      "start_time": "...",
+      "end_time": null,
+      "wall_clock_seconds": null,
+      "completed": false,
+      "error": "CUDA out of memory",
+      "tasks_completed": 2,
+      "tasks_total": 14
+    },
+    "efficiency": {
+      "start_time": null,
+      "end_time": null,
+      "completed": false,
+      "error": "not_reached"
+    }
+  }
+}
+```
+
+**Write strategy:**
+- The metrics file is created (or opened) at the start of each training phase and each eval benchmark.
+- After each benchmark completes (success or failure), the corresponding section is updated and the file is flushed to disk immediately (`f.flush()` + `os.fsync(f.fileno())`).
+- On crash recovery, the orchestrator reads the existing metrics file to determine which benchmarks have already been captured, avoiding redundant re-runs.
+- The file uses atomic writes (write to temp, rename) to prevent corruption from mid-write crashes.
+
+### 21.4 Implementation Points
+
+- [ ] **Add a `MetricsCollector` class** to `src/utils/metrics_collector.py` that manages the incremental metrics file. Methods: `start_phase(phase)`, `end_phase(phase, result)`, `start_benchmark(name)`, `end_benchmark(name, result, error)`, `record_efficiency(metrics)`, `mark_interrupted(reason)`, `flush()`.
+- [ ] **Call `MetricsCollector` from the training scripts** (`train_redpajama.py`, `train_longalpaca.py`) at phase start, phase end, and on crash (via `try/finally` or signal handler).
+- [ ] **Call `MetricsCollector` from `run_experiment.py`** before and after each benchmark (PG-19, Proof-pile, LongBench, efficiency). Write results immediately after each benchmark completes, not after all four.
+- [ ] **Record GPU memory** using `torch.cuda.max_memory_allocated()` at the end of each benchmark. Reset the peak counter at the start of each benchmark with `torch.cuda.reset_peak_memory_stats()`.
+- [ ] **Record actual cache size** from `SpectralDynamicCache.get_compression_ratio()` during the efficiency benchmark. Compare to the theoretical `gamma * baseline` to verify the compression is working as expected.
+- [ ] **Handle interruption gracefully.** If a process receives SIGTERM or SIGKILL (pod eviction), the `try/finally` block should write `interrupted: true` with a best-effort timestamp. For SIGKILL (which cannot be caught), the absence of an `end_time` in the metrics file serves as the signal that the run was interrupted.
+- [ ] **Add metrics file to orchestrator state.** Track the metrics file path in `orchestrator_state.json` alongside the per-run log path (Section 19.2). This lets post-experiment analysis programmatically locate metrics without guessing paths.
+- [ ] **Add a metrics aggregation script** (`scripts/aggregate_metrics.py`) that reads all `metrics.json` files across configs and seeds, produces a summary table (training time, memory, latency, overhead per config), and exports to CSV for statistical analysis.
+- [ ] **Test the incremental write with a deliberate kill.** Start a training run, kill it mid-phase with `kill -9`, and verify the metrics file contains the partial data (start_time, steps_completed, interrupted=true, no end_time).
+
+### 21.5 Why This Matters for N=30
+
+At N=30 scale (390 runs), crashes are not exceptional -- they are expected. The N=1 run experienced 19 crash/restart cycles for C00 alone, a pod eviction for C11, and multiple eval crashes for all 12 compressed configs. Without incremental metrics capture, any crash that occurs before the efficiency benchmark destroys irreplaceable data.
+
+The metrics file is the only source for:
+- **Training cost analysis**: total wall-clock time per config (including recovery overhead), GPU-hours consumed, steps/second
+- **Efficiency comparison**: memory savings from compression (the core research question), latency tradeoffs, overhead of spectral transforms
+- **Cost-benefit analysis**: does the memory savings from lower gamma justify the perplexity degradation? This requires both quality metrics (perplexity, LongBench) and efficiency metrics (memory, latency) for the same config.
+
+Without this data, the research cannot answer "how much memory does spectral KV-cache compression save, and at what cost in latency and quality?" -- which is the central question of the dissertation.
