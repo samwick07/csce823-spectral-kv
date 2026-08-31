@@ -192,7 +192,7 @@ def apply_spectral_compression(
                 hidden_states: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None,
                 position_ids: Optional[torch.Tensor] = None,
-                past_key_value=None,
+                past_key_values=None,
                 output_attentions: bool = False,
                 use_cache: bool = False,
                 **kwargs,
@@ -202,7 +202,7 @@ def apply_spectral_compression(
                     hidden_states=hidden_states,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    past_key_value=past_key_value,
+                    past_key_values=past_key_values,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     spectral_cache=cache,
@@ -223,7 +223,7 @@ def _spectral_forward(
     hidden_states: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
     position_ids: Optional[torch.Tensor] = None,
-    past_key_value=None,
+    past_key_values=None,
     output_attentions: bool = False,
     use_cache: bool = False,
     spectral_cache: SpectralKVCache = None,
@@ -291,18 +291,18 @@ def _spectral_forward(
 
     # 3. [SPECTRAL] Compress or append K/V
     #
-    # Generation path: if past_key_value is a SpectralDynamicCache,
+    # Generation path: if past_key_values is a SpectralDynamicCache,
     # use the Cache protocol for incremental updates (K=1).
     # Training path: always compress full sequence (no cache reuse).
     is_decode_step = (
-        isinstance(past_key_value, SpectralDynamicCache)
+        isinstance(past_key_values, SpectralDynamicCache)
         and q_len == 1
-        and past_key_value.get_seq_length(layer_idx) > 0
+        and past_key_values.get_seq_length(layer_idx) > 0
     )
 
     if is_decode_step:
         # Decode: append new token's K/V, get full reconstructed K/V back
-        key_states, value_states = past_key_value.update(
+        key_states, value_states = past_key_values.update(
             key_states, value_states, layer_idx
         )
     else:
@@ -314,7 +314,7 @@ def _spectral_forward(
 
         # If using a SpectralDynamicCache, update it so future decode
         # steps know the cache is populated
-        if isinstance(past_key_value, SpectralDynamicCache):
+        if isinstance(past_key_values, SpectralDynamicCache):
             # The compress() call above already populated spectral_cache;
             # SpectralDynamicCache just needs to know seq_length is nonzero.
             pass
@@ -347,7 +347,7 @@ def _spectral_forward(
     attn_output = attn_module.o_proj(attn_output)
 
     # Return in HF's expected format.
-    # transformers <4.50: (attn_output, attn_weights, past_key_value)
+    # transformers <4.50: (attn_output, attn_weights, past_key_values)
     # transformers >=4.50: (attn_output, attn_weights) — cache updated in-place
     return attn_output, attn_weights
 
@@ -448,7 +448,7 @@ def reset_all_caches(model: nn.Module) -> None:
 def create_spectral_dynamic_cache(model: nn.Module) -> SpectralDynamicCache:
     """Create a SpectralDynamicCache wrapping the model's per-layer caches.
 
-    Pass this to model.generate(past_key_value=...) so that HF's generation
+    Pass this to model.generate(past_key_values=...) so that HF's generation
     loop passes only the new token at each decode step instead of the full
     sequence. This is what activates the K=1 incremental caching path.
 

@@ -56,17 +56,30 @@ def evaluate_proof_pile(
     # EleutherAI/proof-pile-2 is the newer version (also jsonl.zst).
     pp_names = [
         ("hoskinson-center/proof-pile", {"split": "test", "trust_remote_code": True}),
-        ("EleutherAI/proof-pile-2", {"split": "test"}),
+        ("EleutherAI/proof-pile-2", {"split": "test", "trust_remote_code": True}),
         ("EleutherAI/proof-pile", {"split": "test", "trust_remote_code": True}),
     ]
     dataset = None
+    import time as _time
     for pp_name, pp_kwargs in pp_names:
-        try:
-            dataset = load_dataset(pp_name, **pp_kwargs)
-            logger.info(f"Loaded Proof-pile from {pp_name}: {len(dataset)} rows")
+        for attempt in range(3):
+            try:
+                dataset = load_dataset(pp_name, **pp_kwargs)
+                logger.info(f"Loaded Proof-pile from {pp_name}: {len(dataset)} rows")
+                break
+            except Exception as e:
+                if "429" in str(e) and attempt < 2:
+                    wait = 30 * (attempt + 1)
+                    logger.warning(
+                        f"Rate limited on {pp_name} (attempt {attempt+1}/3). "
+                        f"Waiting {wait}s before retry..."
+                    )
+                    _time.sleep(wait)
+                    continue
+                logger.warning(f"Could not load {pp_name}: {e}")
+                break
+        if dataset is not None:
             break
-        except Exception as e:
-            logger.warning(f"Could not load {pp_name}: {e}")
     if dataset is None:
         raise RuntimeError(f"Could not load Proof-pile. Tried: {[n[0] for n in pp_names]}")
 
