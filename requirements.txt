@@ -1,0 +1,37 @@
+# Core ML
+torch>=2.2
+transformers>=4.43,<5.0
+peft>=0.12
+deepspeed>=0.15
+# FlashAttention-2 for post-spectral-reconstruction attention (Fix 2).
+# NOT in requirements.txt because pip build isolation breaks it (setup.py
+# imports torch). Installed separately by setup_env.sh with --no-build-isolation
+# after torch is already in the venv. If build fails, falls back to SDPA.
+# flash-attn>=2.5
+datasets>=2.20,<3.0
+accelerate>=0.34
+
+# Evaluation
+lm-eval>=0.4
+
+# Statistical analysis
+scipy>=1.14
+statsmodels>=0.14
+scikit-posthocs>=0.10
+matplotlib>=3.9
+seaborn>=0.13
+
+# Experiment tracking
+wandb
+tensorboard
+
+# Reproducibility (HF Hub upload)
+huggingface_hub>=0.25
+
+# Utilities
+tqdm
+pandas
+pyyaml
+numpy
+pytest>=8.0
+zstandard

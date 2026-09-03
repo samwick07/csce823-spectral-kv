@@ -1,3 +1,4 @@
+# LaTeX build artifacts
 *.aux
 *.bbl
 *.blg
@@ -6,3 +7,52 @@
 *.fdb_latexmk
 *.fls
 *.synctex.gz
+
+# Results and checkpoints
+results/
+checkpoints/
+logs/
+exfil/
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+.orchestrator_pid
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+csce823-venv/
+
+# Experiment tracking
+wandb/
+runs/
+tb_logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# HuggingFace cache
+.cache/
+
+# Jupyter
+.ipynb_checkpoints/
+sfactory.config.yaml
+.sfactory/
