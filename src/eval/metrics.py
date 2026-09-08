@@ -59,23 +59,19 @@ def compute_sliding_window_perplexity(
     window_size: int = 256,
     stride: int | None = None,
     device: str = "cuda",
-    seq_len: int = 2048,
 ) -> float:
-    """Compute perplexity using seq_len-sized chunks with sliding windows within.
+    """Compute perplexity using a sliding window approach.
 
-    Following FreqKV's evaluation protocol: process the text in seq_len-sized
-    chunks (not window_size-sized). This ensures compression is active during
-    evaluation when seq_len > cache_size. Within each chunk, loss is computed
-    on window_size sliding windows.
+    Following the protocol: sliding window of 256 tokens.
+    This evaluates the model's perplexity on long texts by processing
+    overlapping windows and averaging the negative log-likelihood.
 
     Args:
         model: The language model.
         input_ids: Token IDs [1, seq_len] or [seq_len].
-        window_size: Size of the sliding window for loss computation (default 256).
+        window_size: Size of the sliding window (default 256).
         stride: Step size between windows. Defaults to window_size (no overlap).
         device: Device to run on.
-        seq_len: Chunk size for processing. Must be >= cache_size for compression
-                 to activate. Default 2048.
 
     Returns:
         Average perplexity across all windows.
@@ -90,7 +86,7 @@ def compute_sliding_window_perplexity(
     total_loss = 0.0
     total_tokens = 0
 
-    full_len = input_ids.shape[1]
+    seq_len = input_ids.shape[1]
 
     # Import here to avoid circular import
     try:
@@ -100,37 +96,30 @@ def compute_sliding_window_perplexity(
         has_spectral = False
 
     with torch.no_grad():
-        # Process in seq_len-sized chunks
-        for chunk_start in range(0, full_len - window_size + 1, seq_len):
-            chunk_end = min(chunk_start + seq_len, full_len)
-            chunk = input_ids[:, chunk_start:chunk_end].to(device)
+        for start in range(0, seq_len - window_size + 1, stride):
+            end = start + window_size
+            window = input_ids[:, start:end].to(device)
 
-            if chunk.shape[1] < window_size:
-                continue
-
-            # Reset spectral caches between chunks
+            # Reset spectral caches between windows so each window
+            # is compressed independently (no cross-window cache leakage)
             if has_spectral:
                 reset_all_caches(model)
 
-            # Forward pass on the full chunk (compression active if seq_len > cache_size)
-            outputs = model(chunk)
+            outputs = model(window)
             logits = outputs.logits
 
-            # Compute loss on sliding windows within the chunk
-            for win_start in range(0, chunk.shape[1] - window_size + 1, stride):
-                win_end = win_start + window_size
+            # Compute loss for this window
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = window[..., 1:].contiguous()
 
-                shift_logits = logits[:, win_start:win_end - 1, :].contiguous()
-                shift_labels = chunk[:, win_start + 1:win_end, :].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                reduction="sum",
+            )
 
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, shift_logits.size(-1)),
-                    shift_labels.view(-1),
-                    reduction="sum",
-                )
-
-                total_loss += loss.item()
-                total_tokens += (win_end - win_start - 1)
+            total_loss += loss.item()
+            total_tokens += (end - start - 1)
 
     avg_loss = total_loss / max(total_tokens, 1)
     return math.exp(avg_loss)
@@ -141,7 +130,7 @@ def compute_efficiency_metrics(
     input_ids: torch.Tensor,
     generate_length: int = 128,
     device: str = "cuda",
-    past_key_value=None,
+    past_key_values=None,
 ) -> EfficiencyMetrics:
     """Measure efficiency metrics: memory, latency, overhead.
 
@@ -150,7 +139,7 @@ def compute_efficiency_metrics(
         input_ids: Prompt token IDs [1, prompt_len].
         generate_length: Number of tokens to generate for latency measurement.
         device: Device to run on.
-        past_key_value: Optional DynamicCache for KV caching during generation.
+        past_key_values: Optional SpectralDynamicCache for incremental KV caching.
 
     Returns:
         EfficiencyMetrics with measured values.
@@ -162,8 +151,8 @@ def compute_efficiency_metrics(
     torch.cuda.synchronize()
 
     # Reset cache if provided
-    if past_key_value is not None:
-        past_key_value.reset()
+    if past_key_values is not None:
+        past_key_values.reset()
 
     # Measure generation latency
     start_time = time.perf_counter()
@@ -174,8 +163,8 @@ def compute_efficiency_metrics(
             do_sample=False,
             use_cache=True,
         )
-        if past_key_value is not None:
-            gen_kwargs["past_key_value"] = past_key_value
+        if past_key_values is not None:
+            gen_kwargs["past_key_values"] = past_key_values
         outputs = model.generate(
             input_ids.to(device),
             **gen_kwargs,

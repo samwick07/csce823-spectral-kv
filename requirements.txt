@@ -34,3 +34,4 @@ pandas
 pyyaml
 numpy
 pytest>=8.0
+zstandard

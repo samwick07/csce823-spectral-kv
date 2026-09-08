@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import logging
 import sys
 from pathlib import Path
@@ -98,6 +99,7 @@ def run_evaluation(
     checkpoint: str | None = None,
     seed: int = 0,
     hf_token: str | None = None,
+    benchmarks: list[str] | None = None,
 ) -> dict:
     """Run evaluation suite for a trained model.
 
@@ -107,6 +109,8 @@ def run_evaluation(
                    with compression (for baseline or untrained comparison).
         seed: Random seed for evaluation stochasticity.
         hf_token: HuggingFace token.
+        benchmarks: Optional list of benchmark names to run. If None, runs all.
+                   When running a subset, existing results are merged (not overwritten).
 
     Returns:
         Dict with all evaluation results.
@@ -116,7 +120,10 @@ def run_evaluation(
 
     # Initialize W&B for evaluation
     try:
-        from .utils.wandb_utils import init_wandb, log_eval_results, finish_wandb
+        try:
+            from .utils.wandb_utils import init_wandb, log_eval_results, finish_wandb
+        except ImportError:
+            from src.utils.wandb_utils import init_wandb, log_eval_results, finish_wandb
         wandb_run = init_wandb(config, phase=f"eval_seed{seed}")
         use_wandb = True
     except Exception as e:
@@ -164,6 +171,13 @@ def run_evaluation(
         logger.info(f"Loading LoRA checkpoint: {checkpoint}")
         model = PeftModel.from_pretrained(model, checkpoint)
 
+    # Ensure all submodules (including spectral caches added after
+    # from_pretrained) are on the correct device. device_map="auto"
+    # places the base model, but newly registered spectral_cache submodules
+    # start on CPU and need explicit movement.
+    target_device = next(model.parameters()).device
+    model = model.to(target_device)
+
     model.eval()
 
     # Log compression stats
@@ -179,121 +193,164 @@ def run_evaluation(
     if spectral_cache is not None:
         logger.info("DynamicCache enabled for generation (FreqKV iterate path)")
 
-    all_results = {
-        "config_id": config.config_id,
-        "seed": seed,
-        "model_name": model_name,
-        "compression": {
-            "transform_type": config.transform_type,
-            "filter_type": config.filter_type,
-            "gamma": config.gamma,
-        },
+    # Determine which benchmarks to run
+    all_benchmarks = ["pg19", "proof_pile", "longbench", "efficiency"]
+    run_benchmarks = benchmarks if benchmarks else all_benchmarks
+
+    # Load existing results if doing a partial eval (merge mode)
+    _results_dir = Path(config.output_dir) / "raw" / config.config_id / f"seed_{seed}"
+    _results_file = _results_dir / "all_results.json"
+    if benchmarks and _results_file.exists():
+        try:
+            with open(_results_file) as _f:
+                all_results = json.load(_f)
+            logger.info(f"Merging with existing results from {_results_file} "
+                        f"(running: {run_benchmarks})")
+        except (json.JSONDecodeError, OSError) as _e:
+            logger.warning(f"Could not load existing results for merge: {_e}")
+            all_results = {}
+    else:
+        all_results = {}
+
+    all_results["config_id"] = config.config_id
+    all_results["seed"] = seed
+    all_results["model_name"] = model_name
+    all_results["compression"] = {
+        "transform_type": config.transform_type,
+        "filter_type": config.filter_type,
+        "gamma": config.gamma,
     }
 
     # 5. PG-19 evaluation
-    logger.info("=" * 40)
-    logger.info("Evaluating PG-19")
-    logger.info("=" * 40)
-    reset_all_caches(model)
-    pg19_results = evaluate_pg19(
-        model=model,
-        tokenizer=tokenizer,
-        model_name=model_name,
-        num_samples=config.pg19_samples,
-        window_size=config.eval_window_size,
-        seed=seed,
-        hf_token=hf_token,
-    )
-    all_results["pg19"] = pg19_results
-    if use_wandb:
-        log_eval_results(pg19_results, config.config_id, seed)
-
-    # 6. Proof-pile evaluation
-    logger.info("=" * 40)
-    logger.info("Evaluating Proof-pile")
-    logger.info("=" * 40)
-    reset_all_caches(model)
-    proof_results = evaluate_proof_pile(
-        model=model,
-        tokenizer=tokenizer,
-        model_name=model_name,
-        num_samples=config.proof_pile_samples,
-        window_size=config.eval_window_size,
-        seed=seed,
-        hf_token=hf_token,
-    )
-    all_results["proof_pile"] = proof_results
-    if use_wandb:
-        log_eval_results(proof_results, config.config_id, seed)
-
-    # 7. LongBench evaluation
-    logger.info("=" * 40)
-    logger.info("Evaluating LongBench V1")
-    logger.info("=" * 40)
-    reset_all_caches(model)
-    longbench_tasks = config.longbench_tasks
-    longbench_results = evaluate_longbench(
-        model=model,
-        tokenizer=tokenizer,
-        model_name=model_name,
-        tasks=longbench_tasks,
-        temperature=config.eval_temperature,
-        top_p=config.eval_top_p,
-        seed=seed,
-        hf_token=hf_token,
-        past_key_value=spectral_cache,
-    )
-    all_results["longbench"] = longbench_results
-    if use_wandb:
-        log_eval_results(longbench_results, config.config_id, seed)
-
-    # 8. Efficiency measurement
-    logger.info("=" * 40)
-    logger.info("Measuring Efficiency")
-    logger.info("=" * 40)
-    reset_all_caches(model)
-    prompt = "The quick brown fox jumps over the lazy dog. " * 50
-    input_ids = tokenizer(prompt, return_tensors="pt").input_ids
-    efficiency_metrics = measure_efficiency(
-        model=model,
-        tokenizer=tokenizer,
-        prompt=prompt,
-        generate_length=128,
-        past_key_value=spectral_cache,
-    )
-    all_results["efficiency"] = {
-        "peak_kv_memory_gb": efficiency_metrics.peak_kv_memory_gb,
-        "decoding_latency_ms_per_token": efficiency_metrics.decoding_latency_ms_per_token,
-        "compression_overhead_pct": efficiency_metrics.compression_overhead_pct,
-        "total_decode_time_s": efficiency_metrics.total_decode_time_s,
-        "num_tokens_generated": efficiency_metrics.num_tokens_generated,
-    }
-    if use_wandb:
-        log_eval_results(all_results["efficiency"], config.config_id, seed)
-
-    # 9. Save results
+    if "pg19" in run_benchmarks:
+        logger.info("=" * 40)
+        logger.info("Evaluating PG-19")
+        logger.info("=" * 40)
+        reset_all_caches(model)
+        pg19_results = evaluate_pg19(
+            model=model,
+            tokenizer=tokenizer,
+            model_name=model_name,
+            num_samples=config.pg19_samples,
+            window_size=config.eval_window_size,
+            seed=seed,
+            hf_token=hf_token,
+        )
+        all_results["pg19"] = pg19_results
+        if use_wandb:
+            log_eval_results(pg19_results, config.config_id, seed)
+    else:
+        logger.info("Skipping PG-19 (not in benchmark list)")
+# 6. Proof-pile evaluation
+    if "proof_pile" in run_benchmarks:
+        logger.info("=" * 40)
+        logger.info("Evaluating Proof-pile")
+        logger.info("=" * 40)
+        reset_all_caches(model)
+        proof_results = evaluate_proof_pile(
+            model=model,
+            tokenizer=tokenizer,
+            model_name=model_name,
+            num_samples=config.proof_pile_samples,
+            window_size=config.eval_window_size,
+            seed=seed,
+            hf_token=hf_token,
+        )
+        all_results["proof_pile"] = proof_results
+        if use_wandb:
+            log_eval_results(proof_results, config.config_id, seed)
+    else:
+        logger.info("Skipping Proof-pile (not in benchmark list)")
+# 7. LongBench evaluation
+    if "longbench" in run_benchmarks:
+        logger.info("=" * 40)
+        logger.info("Evaluating LongBench V1")
+        logger.info("=" * 40)
+        reset_all_caches(model)
+        longbench_tasks = config.longbench_tasks
+        longbench_results = evaluate_longbench(
+            model=model,
+            tokenizer=tokenizer,
+            model_name=model_name,
+            tasks=longbench_tasks,
+            temperature=config.eval_temperature,
+            top_p=config.eval_top_p,
+            seed=seed,
+            hf_token=hf_token,
+            past_key_values=spectral_cache,
+        )
+        all_results["longbench"] = longbench_results
+        if use_wandb:
+            log_eval_results(longbench_results, config.config_id, seed)
+    else:
+        logger.info("Skipping LongBench V1 (not in benchmark list)")
+# 8. Efficiency measurement
+    if "efficiency" in run_benchmarks:
+        logger.info("=" * 40)
+        logger.info("Measuring Efficiency")
+        logger.info("=" * 40)
+        reset_all_caches(model)
+        prompt = "The quick brown fox jumps over the lazy dog. " * 50
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+        efficiency_metrics = measure_efficiency(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            generate_length=128,
+            past_key_values=spectral_cache,
+        )
+        all_results["efficiency"] = {
+            "peak_kv_memory_gb": efficiency_metrics.peak_kv_memory_gb,
+            "decoding_latency_ms_per_token": efficiency_metrics.decoding_latency_ms_per_token,
+            "compression_overhead_pct": efficiency_metrics.compression_overhead_pct,
+            "total_decode_time_s": efficiency_metrics.total_decode_time_s,
+            "num_tokens_generated": efficiency_metrics.num_tokens_generated,
+        }
+        if use_wandb:
+            log_eval_results(all_results["efficiency"], config.config_id, seed)
+    else:
+        logger.info("Skipping Efficiency (not in benchmark list)")
+# 9. Save results
     results_dir = Path(config.output_dir) / "raw" / config.config_id / f"seed_{seed}"
     results_dir.mkdir(parents=True, exist_ok=True)
 
     results_file = results_dir / "all_results.json"
-    with open(results_file, "w") as f:
-        # Convert numpy types for JSON serialization
-        def default_serializer(obj):
-            if isinstance(obj, (torch.Tensor)):
-                return obj.tolist() if obj.numel() < 1000 else f"Tensor{tuple(obj.shape)}"
-            if isinstance(obj, (float, int, str, bool, type(None))):
-                return obj
-            if isinstance(obj, list):
-                return obj
-            return str(obj)
-        json.dump(all_results, f, indent=2, default=default_serializer)
+
+    # Convert numpy types for JSON serialization
+    def default_serializer(obj):
+        if isinstance(obj, (torch.Tensor)):
+            return obj.tolist() if obj.numel() < 1000 else f"Tensor{tuple(obj.shape)}"
+        if isinstance(obj, (float, int, str, bool, type(None))):
+            return obj
+        if isinstance(obj, list):
+            return obj
+        return str(obj)
+
+    # Atomic write: write to temp file, then rename (prevents corruption
+    # if two processes ever write the same file concurrently).
+    import tempfile
+    def _atomic_write_json(path, data):
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), suffix=".tmp", prefix=path.stem
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2, default=default_serializer)
+            os.replace(tmp_path, str(path))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    _atomic_write_json(results_file, all_results)
 
     # Also save individual benchmark results
     for benchmark_name in ["pg19", "proof_pile", "longbench", "efficiency"]:
         if benchmark_name in all_results:
             bench_file = results_dir / f"{benchmark_name}.json"
-            with open(bench_file, "w") as f:
-                json.dump(all_results[benchmark_name], f, indent=2, default=default_serializer)
+            _atomic_write_json(bench_file, all_results[benchmark_name])
 
     logger.info(f"Results saved to {results_dir}")
 
@@ -358,6 +415,13 @@ def main():
         default=None,
         help="Optional log file path",
     )
+    parser.add_argument(
+        "--benchmarks",
+        type=str,
+        default=None,
+        help="Comma-separated benchmark names (e.g. 'pg19,proof_pile'). "
+             "If None, runs all benchmarks. Existing results are merged.",
+    )
 
     args = parser.parse_args()
 
@@ -387,12 +451,19 @@ def main():
         if args.mode == "full":
             args.checkpoint = ckpt
 
+    # Parse --benchmarks
+    benchmarks = None
+    if args.benchmarks:
+        benchmarks = [b.strip() for b in args.benchmarks.split(",") if b.strip()]
+        logger.info(f"Running benchmarks: {benchmarks}")
+
     if args.mode in ("eval", "full"):
         results = run_evaluation(
             config,
             checkpoint=args.checkpoint,
             seed=args.seed,
             hf_token=args.hf_token,
+            benchmarks=benchmarks,
         )
         logger.info("Evaluation complete!")
         logger.info(f"  PG-19 PPL: {results.get('pg19', {}).get('mean_perplexity', 'N/A')}")
