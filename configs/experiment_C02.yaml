@@ -28,3 +28,7 @@ experiment_name: dct_fixed_g022
 transform_type: dct
 filter_type: fixed
 gamma: 0.22
+sink_size: 4
+recent_size: 8
+cache_size: 8192
+use_flash_attn: true

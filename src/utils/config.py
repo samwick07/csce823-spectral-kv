@@ -24,6 +24,11 @@ class ExperimentConfig:
     max_seq_len: int = 16384
     init_sharpness: float = 10.0
     init_offset: float = 0.0
+    # FreqKV chunk-wise compression parameters
+    sink_size: int = 4                # Uncompressed initial tokens (attention sink)
+    recent_size: int = 8              # Uncompressed recent tokens (sliding window)
+    cache_size: int = 8192            # Max KV cache size; compression triggers above this
+    use_flash_attn: bool = True       # Use FlashAttention-2 for chunk attention
 
     # Model settings
     model_name: str = DEFAULT_MODEL_NAME

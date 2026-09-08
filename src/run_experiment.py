@@ -29,7 +29,7 @@ try:
     from .spectral.attention import (
         reset_all_caches,
         get_compression_stats,
-        create_spectral_dynamic_cache,
+        get_spectral_compressors as get_spectral_caches,
     )
     from .training.train_redpajama import train_redpajama
     from .training.train_longalpaca import train_longalpaca
@@ -47,7 +47,7 @@ except ImportError:
     from src.spectral.attention import (
         reset_all_caches,
         get_compression_stats,
-        create_spectral_dynamic_cache,
+        get_spectral_compressors as get_spectral_caches,
     )
     from src.training.train_redpajama import train_redpajama
     from src.training.train_longalpaca import train_longalpaca
@@ -142,7 +142,8 @@ def run_evaluation(
         device_map="auto",
     )
 
-    # 3. Apply spectral compression
+    # 3. Apply spectral compression (is_iterate=False for perplexity eval;
+    #    generation uses is_iterate=True via the iterate forward installed here)
     comp_config = CompressionConfig(
         transform_type=config.transform_type,
         filter_type=config.filter_type,
@@ -150,8 +151,13 @@ def run_evaluation(
         max_seq_len=config.max_seq_len,
         init_sharpness=config.init_sharpness,
         init_offset=config.init_offset,
+        sink_size=getattr(config, "sink_size", 4),
+        recent_size=getattr(config, "recent_size", 8),
+        cache_size=getattr(config, "cache_size", 8192),
+        use_flash_attn=getattr(config, "use_flash_attn", True),
     )
-    model = apply_spectral_compression(model, comp_config)
+    # Use iterate path for eval (handles both perplexity and generation)
+    model = apply_spectral_compression(model, comp_config, is_iterate=True)
 
     # 4. Load trained checkpoint if provided
     if checkpoint:
@@ -165,13 +171,13 @@ def run_evaluation(
     for s in stats[:3]:  # Log first 3 layers
         logger.info(f"  Layer {s['layer']}: ratio={s['compression_ratio']:.4f}")
 
-    # Create SpectralDynamicCache for incremental KV caching during generation.
-    # This makes HF's generate() pass only the new token at each decode step
-    # (K=1 incremental caching), reducing generation from O(N^2) to O(N log N).
-    # For baseline configs (no compression), this is None (HF uses its own DynamicCache).
-    spectral_cache = create_spectral_dynamic_cache(model) if not config.is_baseline else None
+    # Standard DynamicCache for generation (FreqKV iterate forward manages
+    # compression internally, keeping cache bounded at cache_size).
+    # For baseline configs, HF uses its own DynamicCache automatically.
+    from transformers.cache_utils import DynamicCache
+    spectral_cache = None if config.is_baseline else DynamicCache()
     if spectral_cache is not None:
-        logger.info("SpectralDynamicCache enabled for incremental generation (K=1)")
+        logger.info("DynamicCache enabled for generation (FreqKV iterate path)")
 
     all_results = {
         "config_id": config.config_id,

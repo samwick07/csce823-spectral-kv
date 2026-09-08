@@ -90,8 +90,13 @@ def train_longalpaca(
         max_seq_len=config.max_seq_len,
         init_sharpness=config.init_sharpness,
         init_offset=config.init_offset,
+        sink_size=getattr(config, "sink_size", 4),
+        recent_size=getattr(config, "recent_size", 8),
+        cache_size=getattr(config, "cache_size", 8192),
+        use_flash_attn=getattr(config, "use_flash_attn", True),
     )
-    model = apply_spectral_compression(model, comp_config)
+    # Phase 2: is_iterate=True (matching FreqKV SFT training protocol)
+    model = apply_spectral_compression(model, comp_config, is_iterate=True)
 
     # 4. Load Phase 1 LoRA adapters
     #    The spectral_cache module is saved by modules_to_save, so it

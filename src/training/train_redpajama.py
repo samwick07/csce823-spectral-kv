@@ -81,7 +81,7 @@ def train_redpajama(
     )
 
     # 3. Apply spectral compression BEFORE LoRA
-    #    This inserts the spectral cache into each attention layer
+    #    This inserts the FreqKV chunk-wise compressor into each attention layer
     comp_config = CompressionConfig(
         transform_type=config.transform_type,
         filter_type=config.filter_type,
@@ -89,8 +89,13 @@ def train_redpajama(
         max_seq_len=config.max_seq_len,
         init_sharpness=config.init_sharpness,
         init_offset=config.init_offset,
+        sink_size=getattr(config, "sink_size", 4),
+        recent_size=getattr(config, "recent_size", 8),
+        cache_size=getattr(config, "cache_size", 8192),
+        use_flash_attn=getattr(config, "use_flash_attn", True),
     )
-    model = apply_spectral_compression(model, comp_config)
+    # Phase 1: is_iterate=True (matching FreqKV SFT training protocol)
+    model = apply_spectral_compression(model, comp_config, is_iterate=True)
 
     # 4. Apply LoRA (spectral_cache modules saved via modules_to_save)
     lora_config = create_lora_config(

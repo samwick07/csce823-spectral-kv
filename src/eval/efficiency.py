@@ -30,7 +30,7 @@ def measure_efficiency(
         generate_length: Number of tokens to generate.
         device: Device to run on.
         baseline_time: Decoding time of the uncompressed baseline (for overhead calc).
-        past_key_value: Optional SpectralDynamicCache for incremental KV caching.
+        past_key_value: Optional DynamicCache for KV caching during generation.
 
     Returns:
         EfficiencyMetrics with measured values.

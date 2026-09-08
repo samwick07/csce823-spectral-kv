@@ -2,16 +2,19 @@
 
 from .transform import DCTTransform, FFTTransform, SpectralTransform
 from .filter import FixedLowPassFilter, LearnableSpectralFilter, SpectralFilter
-from .cache import CompressionConfig, SpectralKVCache, SpectralDynamicCache
+from .cache import CompressionConfig, SpectralKVCompressor
 from .attention import (
     apply_spectral_compression,
-    get_spectral_caches,
+    get_spectral_compressors,
+    get_spectral_caches,  # backward compat alias for get_spectral_compressors
     get_compression_stats,
     get_learnable_filter_params,
     reset_all_caches,
-    create_spectral_dynamic_cache,
     CompressedAttention,
 )
+
+# Backward compatibility aliases
+SpectralKVCache = SpectralKVCompressor
 
 __all__ = [
     "SpectralTransform",
@@ -21,13 +24,13 @@ __all__ = [
     "FixedLowPassFilter",
     "LearnableSpectralFilter",
     "CompressionConfig",
-    "SpectralKVCache",
-    "SpectralDynamicCache",
+    "SpectralKVCompressor",
+    "SpectralKVCache",  # backward compat alias
     "apply_spectral_compression",
-    "get_spectral_caches",
+    "get_spectral_compressors",
+    "get_spectral_caches",  # backward compat
     "get_compression_stats",
     "get_learnable_filter_params",
     "reset_all_caches",
-    "create_spectral_dynamic_cache",
     "CompressedAttention",
 ]
